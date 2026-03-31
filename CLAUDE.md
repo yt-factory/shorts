@@ -7,7 +7,7 @@ Part of the [YT-Factory](../CLAUDE.md) platform. Processes handwritten calligrap
 Single-file Python CLI (`ink_video_processor.py`, ~1500 lines, 28 functions) with a 14-step processing pipeline.
 
 ```
-Raw video (phone face-down) → ink_video_processor.py → YouTube Shorts (9:16, 1080x1920)
+Raw video (phone upside-down, back camera facing user) → ink_video_processor.py → YouTube Shorts (9:16, 1080x1920)
 ```
 
 ### Pipeline Flow

@@ -254,7 +254,7 @@ def detect_orientation(video_path):
     """
     检测视频是否倒置。
 
-    原理：手机倒扣拍摄时画面倒转。通过对比画面上下区域的
+    原理：手机倒置拍摄时（后置摄像头朝向自己）画面倒转。通过对比画面上下区域的
     深色像素密度和边缘密度来判断书脊的位置。
 
     Returns:
@@ -275,7 +275,7 @@ def detect_orientation(video_path):
     top_edges = float(np.mean(cv2.Canny(top, 50, 150)))
     bot_edges = float(np.mean(cv2.Canny(bottom, 50, 150)))
 
-    # 手机倒扣拍摄：书脊在画面底部 = 视频倒了（翻转后书脊移到顶部）
+    # 手机倒置拍摄（后置摄像头朝向自己）：书脊在画面底部 = 视频倒了（翻转后书脊移到顶部）
     # 书脊在画面顶部 = 视频已正确（无需翻转）
     if bot_dark > 0.12 and top_dark < 0.05:
         return {'is_flipped': True, 'confidence': 'high', 'reason': '书脊在底部（需翻转到顶部）'}
@@ -286,7 +286,7 @@ def detect_orientation(video_path):
     if top_edges > bot_edges * 1.5:
         return {'is_flipped': False, 'confidence': 'medium', 'reason': '顶部边缘特征更多（方向正确）'}
 
-    return {'is_flipped': True, 'confidence': 'low', 'reason': '默认倒置（手机倒扣拍摄）'}
+    return {'is_flipped': True, 'confidence': 'low', 'reason': '默认倒置（手机倒置后置摄像头拍摄）'}
 
 
 # ============================================================
