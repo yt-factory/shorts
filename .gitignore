@@ -9,16 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
-# Video files (too large for git)
-*.mp4
-*.m4a
-*.mp3
-*.wav
-*.mov
-
-# Generated artifacts
-*_thumb.jpg
-ink_debug.png
+# Media files (too large for git)
+files/input/*
+files/output/*
+!files/input/.gitkeep
+!files/output/.gitkeep
 
 # Editor
 .idea/
