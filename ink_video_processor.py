@@ -101,7 +101,7 @@ def check_vidstab_support():
     result = subprocess.run(
         ['ffmpeg', '-filters'], capture_output=True, text=True
     )
-    has_vidstab = 'vidstabdetect' in result.stdout
+    has_vidstab = 'vidstabdetect' in (result.stdout + result.stderr)
     if not has_vidstab:
         print("   ⚠️  ffmpeg 未包含 vidstab 支持，跳过防抖步骤")
         print("   （如需防抖：brew install ffmpeg --with-libvidstab）")
@@ -154,6 +154,8 @@ def get_audio_duration(audio_path):
         '-show_format', audio_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ValueError(f"ffprobe 无法读取音频: {audio_path}")
     return float(json.loads(result.stdout)['format']['duration'])
 
 
@@ -197,11 +199,12 @@ def create_still_video(image_path, output_path, duration, fps):
 
 def concat_videos(video_paths, output_path):
     """拼接多个视频文件（使用 concat demuxer）"""
-    tmpdir = os.path.dirname(video_paths[0])
+    tmpdir = os.path.dirname(os.path.abspath(video_paths[0]))
     concat_file = os.path.join(tmpdir, f'concat_{os.getpid()}.txt')
     with open(concat_file, 'w') as f:
         for v in video_paths:
-            f.write(f"file '{v}'\n")
+            escaped_v = v.replace("'", "'\\''")
+            f.write(f"file '{escaped_v}'\n")
 
     run_ffmpeg([
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
@@ -619,6 +622,8 @@ def generate_tts(text: str, target_duration: float, output_dir: str,
     print(f"      文字: {char_count} 字, 可用: {available:.0f}s, 初始语速: {rate}")
 
     # 迭代生成，确保 fit 进时间窗口
+    actual_dur = 0.0
+    boundaries = []
     for attempt in range(max_retries):
         boundaries = asyncio.run(_tts_generate(text, voice, rate, audio_path))
 
@@ -674,15 +679,17 @@ def _ms_to_srt_time(ms: int) -> str:
 
 
 def build_srt_subtitle_filter(srt_path: str, font_path: str = None,
-                              output_width: int = DEFAULT_OUTPUT_WIDTH) -> str:
+                              output_width: int = DEFAULT_OUTPUT_WIDTH,
+                              output_height: int = DEFAULT_OUTPUT_HEIGHT) -> str:
     """
     生成基于 SRT 文件的字幕滤镜（比 drawtext 更精准的时间控制）。
 
     使用 ffmpeg 的 subtitles 滤镜，支持字体、字号、位置等样式。
     为避免路径转义问题，先复制 SRT 到简单路径。
     """
-    # 复制 SRT 到简单路径，避免 ffmpeg subtitles 滤镜的路径转义问题
-    simple_srt = '/tmp/ink_subs.srt'
+    # 复制 SRT 到同目录下的简单文件名，避免 ffmpeg subtitles 滤镜的路径转义问题
+    # 使用 PID 避免并发冲突
+    simple_srt = os.path.join(os.path.dirname(srt_path), f'subs_{os.getpid()}.srt')
     shutil.copy2(srt_path, simple_srt)
 
     font_size = int(output_width * 0.055)
@@ -690,7 +697,7 @@ def build_srt_subtitle_filter(srt_path: str, font_path: str = None,
     # PlayResX/Y 设为视频分辨率，这样 FontSize 就是实际像素值
     style_parts = [
         f"PlayResX={output_width}",
-        "PlayResY=1280",
+        f"PlayResY={output_height}",
         f"FontSize={font_size}",
         "PrimaryColour=&H00FFFFFF",  # 白色文字 (AABBGGRR)
         "OutlineColour=&H00000000",  # 黑色描边
@@ -732,7 +739,19 @@ def normalize_audio(input_audio, output_audio, target_lufs=TARGET_LUFS):
     ]
     result = subprocess.run(measure_cmd, capture_output=True, text=True)
 
-    # 解析测量结果
+    # 解析测量结果（如果第一遍失败，直接用简单模式）
+    if result.returncode != 0:
+        print("      第一遍测量失败，使用简单 loudnorm 模式")
+        simple_cmd = [
+            'ffmpeg', '-y', '-i', input_audio,
+            '-af', f'loudnorm=I={target_lufs}:TP=-1:LRA=11',
+            '-ar', '48000',
+            '-c:a', 'aac', '-b:a', '192k',
+            output_audio
+        ]
+        run_ffmpeg(simple_cmd, "音频标准化(简单模式)")
+        return
+
     stderr = result.stderr
     try:
         # 找到 JSON 输出
@@ -854,7 +873,10 @@ def build_subtitle_filter(text, output_width, output_height, font_path=None):
         font_path: 用户指定的字体路径，None 时自动查找
     """
     # 转义特殊字符
-    escaped = text.replace("'", "'\\''").replace(":", "\\:")
+    escaped = (text.replace("\\", "\\\\")
+                    .replace("'", "'\\''")
+                    .replace(":", "\\:")
+                    .replace("%", "\\%"))
 
     font_size = int(output_width * 0.055)  # 字号约为画面宽度的 5.5%
     y_pos = int(output_height * 0.85)
@@ -1144,13 +1166,8 @@ def process_video(input_path, output_path, voiceover_path=None,
             print("   检测无手帧...")
             clean_frame = find_clean_last_frame(stabilized_input, is_flipped)
 
-            # 对干净帧应用同样的裁剪+缩放+色彩校正
+            # 保存干净帧（已在 find_clean_last_frame 中翻转），用 ffmpeg 处理以保持一致
             import cv2
-            if is_flipped and clean_frame is not None:
-                # 已在 find_clean_last_frame 中翻转过
-                pass
-
-            # 保存干净帧，用 ffmpeg 处理以保持一致
             clean_frame_raw = os.path.join(tmpdir, 'clean_raw.png')
             cv2.imwrite(clean_frame_raw, clean_frame)
 
@@ -1262,7 +1279,7 @@ def process_video(input_path, output_path, voiceover_path=None,
         # 字幕：优先用 TTS 生成的 SRT（时间同步），否则用 --subtitle 静态文字
         if tts_srt_path and os.path.exists(tts_srt_path):
             print(f"\n📝 Step 13: 叠加同步字幕（SRT）...")
-            sub_filter = build_srt_subtitle_filter(tts_srt_path, font_path, output_width)
+            sub_filter = build_srt_subtitle_filter(tts_srt_path, font_path, output_width, output_height)
             post_filters.append(sub_filter)
             print("   ✅ SRT 字幕准备就绪")
         elif subtitle_text:
