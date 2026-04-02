@@ -20,5 +20,8 @@ files/output/*
 .vscode/
 *.swp
 
+# Debug images (generated during processing)
+*_debug.png
+
 # Claude Code local config
 .claude/

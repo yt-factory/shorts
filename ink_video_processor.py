@@ -253,15 +253,32 @@ def extract_frame(video_path, position='last'):
 # Step ①: 方向检测（Feature 6）
 # ============================================================
 
+def _edge_book_score(gray_region):
+    """计算一个区域的书脊得分（深色像素比例 + 边缘密度）"""
+    import cv2
+    import numpy as np
+    dark = float(np.mean(gray_region < 100))
+    edges = float(np.mean(cv2.Canny(gray_region, 50, 150)))
+    return dark + edges
+
+
 def detect_orientation(video_path):
     """
-    检测视频是否倒置。
+    检测视频方向，确定需要的旋转角度。
 
-    原理：手机倒置拍摄时（后置摄像头朝向自己）画面倒转。通过对比画面上下区域的
-    深色像素密度和边缘密度来判断书脊的位置。
+    目标：旋转后书脊永远在画面正上方，字在书脊下方。
+    - 书脊在顶部 → 不旋转
+    - 书脊在底部 → 旋转 180°
+    - 书脊在右侧 → 顺时针旋转 90°（右→上）
+    - 书脊在左侧 → 逆时针旋转 90°（左→上）
 
     Returns:
-        dict: {'is_flipped', 'confidence', 'reason'}
+        dict: {
+            'rotation': str,        # 'none'|'180'|'cw90'|'ccw90'
+            'raw_book_edge': str,   # 原始画面书脊位置
+            'confidence': str,      # 'high'|'medium'|'low'
+            'reason': str,
+        }
     """
     import cv2
     import numpy as np
@@ -270,36 +287,82 @@ def detect_orientation(video_path):
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    top = gray[:int(h * 0.25), :]
-    bottom = gray[int(h * 0.75):, :]
+    # 扫描四个边缘区域
+    edge_scores = {
+        'top': _edge_book_score(gray[:int(h * 0.20), :]),
+        'bottom': _edge_book_score(gray[int(h * 0.80):, :]),
+        'left': _edge_book_score(gray[:, :int(w * 0.20)]),
+        'right': _edge_book_score(gray[:, int(w * 0.80):]),
+    }
 
-    top_dark = float(np.mean(top < 100))
-    bot_dark = float(np.mean(bottom < 100))
-    top_edges = float(np.mean(cv2.Canny(top, 50, 150)))
-    bot_edges = float(np.mean(cv2.Canny(bottom, 50, 150)))
+    # 书脊所在边 = 得分最高的边
+    raw_book_edge = max(edge_scores, key=edge_scores.get)
+    best_score = edge_scores[raw_book_edge]
 
-    # 手机倒置拍摄（后置摄像头朝向自己）：书脊在画面底部 = 视频倒了（翻转后书脊移到顶部）
-    # 书脊在画面顶部 = 视频已正确（无需翻转）
-    if bot_dark > 0.12 and top_dark < 0.05:
-        return {'is_flipped': True, 'confidence': 'high', 'reason': '书脊在底部（需翻转到顶部）'}
-    if top_dark > 0.12 and bot_dark < 0.05:
-        return {'is_flipped': False, 'confidence': 'high', 'reason': '书脊在顶部（方向正确）'}
-    if bot_edges > top_edges * 1.5:
-        return {'is_flipped': True, 'confidence': 'medium', 'reason': '底部边缘特征更多（需翻转）'}
-    if top_edges > bot_edges * 1.5:
-        return {'is_flipped': False, 'confidence': 'medium', 'reason': '顶部边缘特征更多（方向正确）'}
+    # 与次高分比较，判断置信度
+    sorted_scores = sorted(edge_scores.values(), reverse=True)
+    second_score = sorted_scores[1] if len(sorted_scores) > 1 else 0
+    score_ratio = best_score / max(second_score, 0.001)
 
-    return {'is_flipped': True, 'confidence': 'low', 'reason': '默认倒置（手机倒置后置摄像头拍摄）'}
+    if score_ratio > 2.0 and best_score > 0.05:
+        confidence = 'high'
+    elif score_ratio > 1.3 and best_score > 0.03:
+        confidence = 'medium'
+    else:
+        confidence = 'low'
+
+    # 旋转方向：将书脊所在边旋转到顶部
+    # CW90 (transpose=1): left→top, right→bottom
+    # CCW90 (transpose=2): right→top, left→bottom
+    rotation_map = {
+        'top': 'none',      # 已在顶部
+        'bottom': '180',    # 底部→顶部 = 180°
+        'right': 'ccw90',   # 右侧→顶部 = 逆时针 90°
+        'left': 'cw90',     # 左侧→顶部 = 顺时针 90°
+    }
+
+    if confidence == 'low':
+        # 低置信度默认 180°（最常见的手机倒置拍摄场景）
+        rotation = '180'
+    else:
+        rotation = rotation_map[raw_book_edge]
+
+    edge_names = {'top': '顶部', 'bottom': '底部', 'left': '左侧', 'right': '右侧'}
+    rotation_names = {'none': '不旋转', '180': '旋转180°', 'cw90': '顺时针90°', 'ccw90': '逆时针90°'}
+    reason = f"书脊在{edge_names[raw_book_edge]} → {rotation_names[rotation]}"
+
+    return {
+        'rotation': rotation,
+        'raw_book_edge': raw_book_edge,
+        'confidence': confidence,
+        'reason': reason,
+    }
 
 
 # ============================================================
 # Step ③: 墨迹检测
 # ============================================================
 
-def detect_ink_region(video_path, is_flipped=False):
+def _apply_rotation(frame, rotation):
+    """对 cv2 帧应用旋转"""
+    import cv2
+    if rotation == '180':
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif rotation == 'cw90':
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 'ccw90':
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
+def detect_ink_region(video_path, rotation='none'):
     """
     检测墨迹（字）的位置和大小。
-    根据翻转状态动态排除书脊区域。
+    先应用旋转使书脊在顶部，再排除顶部 30% 书脊区域。
+
+    Args:
+        video_path: 视频文件路径
+        rotation: 旋转方式 ('none'|'180'|'cw90'|'ccw90')
 
     Returns:
         dict: {'x', 'y', 'w', 'h', 'cx', 'cy'}
@@ -308,25 +371,21 @@ def detect_ink_region(video_path, is_flipped=False):
     import numpy as np
 
     frame = extract_frame(video_path, 'last')
-    if is_flipped:
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
+    frame = _apply_rotation(frame, rotation)
 
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # 翻转后书在顶部 → 排除顶部 30%
-    # 不翻转时书在底部 → 排除底部 25%
-    if is_flipped:
-        a_top, a_bot = int(h * 0.30), int(h * 0.95)
-    else:
-        a_top, a_bot = int(h * 0.05), int(h * 0.75)
+    # 旋转后书脊永远在顶部 → 排除顶部 30%
+    a_top, a_bot = int(h * 0.30), int(h * 0.95)
+    a_left, a_right = 0, w
 
-    gc = gray[a_top:a_bot, :]
+    gc = gray[a_top:a_bot, a_left:a_right]
     # 全局阈值检测深色像素
     _, mask = cv2.threshold(gc, 55, 255, cv2.THRESH_BINARY_INV)
     # 白纸遮罩：只保留白纸区域上的墨迹（排除书脊上的印刷字）
     # 白纸 = RGB 三通道均 > 180；彩色书脊至少有一个通道偏低
-    color_region = frame[a_top:a_bot, :]
+    color_region = frame[a_top:a_bot, a_left:a_right]
     paper_mask = np.all(color_region > 150, axis=2).astype(np.uint8) * 255
     # 膨胀白纸遮罩，覆盖墨迹笔画本身（笔画不是白色但在白纸上）
     paper_mask = cv2.dilate(paper_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)), iterations=2)
@@ -340,7 +399,8 @@ def detect_ink_region(video_path, is_flipped=False):
     if not contours:
         print("   ⚠️  未检测到墨迹，使用画面中心")
         cy = (a_top + a_bot) // 2
-        return {'x': w//4, 'y': cy - h//8, 'w': w//2, 'h': h//4, 'cx': w//2, 'cy': cy}
+        cx = (a_left + a_right) // 2
+        return {'x': cx - w//4, 'y': cy - h//8, 'w': w//2, 'h': h//4, 'cx': cx, 'cy': cy}
 
     # 面积过滤：最小 0.3%，最大 10%（单个汉字不会超过画面 10%）
     # 形状过滤：排除长条形轮廓（宽高比 > 4:1），这通常是书脊/直线而非汉字
@@ -393,6 +453,8 @@ def detect_ink_region(video_path, is_flipped=False):
             x, yr, bw, bh = cv2.boundingRect(pts)
             print(f"      聚类过滤: {len(clustered)} 个轮廓（去除散落噪点）")
 
+    # 将分析区域坐标映射回全帧坐标
+    x = x + a_left
     y = yr + a_top
 
     # 呼吸空间 20%
@@ -406,14 +468,17 @@ def detect_ink_region(video_path, is_flipped=False):
     dbg = frame.copy()
     cv2.rectangle(dbg, (x, y), (x+bw, y+bh), (0, 255, 0), 3)
     cv2.circle(dbg, (cx, cy), 10, (0, 0, 255), -1)
+    # 画分析区域边界线（水平 + 垂直）
     cv2.line(dbg, (0, a_top), (w, a_top), (255, 0, 0), 2)
     cv2.line(dbg, (0, a_bot), (w, a_bot), (255, 0, 0), 2)
+    cv2.line(dbg, (a_left, 0), (a_left, h), (255, 0, 0), 2)
+    cv2.line(dbg, (a_right, 0), (a_right, h), (255, 0, 0), 2)
     dp = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ink_debug.png')
     cv2.imwrite(dp, dbg)
 
     pct = (bw * bh) / (w * h) * 100
     print(f"   ✅ 墨迹: ({x},{y}) {bw}x{bh}, 占画面 {pct:.1f}%")
-    print(f"      中心: ({cx},{cy}), 分析区域: y={a_top}~{a_bot}")
+    print(f"      中心: ({cx},{cy}), 分析区域: x={a_left}~{a_right}, y={a_top}~{a_bot}")
     print(f"      调试图: {dp}")
 
     return {'x': x, 'y': y, 'w': bw, 'h': bh, 'cx': cx, 'cy': cy}
@@ -423,7 +488,7 @@ def detect_ink_region(video_path, is_flipped=False):
 # Step ⑤: 手部检测（找到干净的最后一帧）
 # ============================================================
 
-def find_clean_last_frame(video_path, is_flipped=False):
+def find_clean_last_frame(video_path, rotation='none'):
     """
     从视频末尾向前搜索，找到第一帧没有手的画面。
 
@@ -449,8 +514,7 @@ def find_clean_last_frame(video_path, is_flipped=False):
         if not ret:
             continue
 
-        if is_flipped:
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        frame = _apply_rotation(frame, rotation)
 
         # 检测肤色区域
         ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
@@ -476,12 +540,9 @@ def find_clean_last_frame(video_path, is_flipped=False):
         print(f"      最佳帧: 肤色占比 {min_skin_ratio*100:.2f}%")
         return best_frame
 
-    # 兜底：直接返回最后一帧（需要保持翻转一致性）
-    import cv2
+    # 兜底：直接返回最后一帧
     frame = extract_frame(video_path, 'last')
-    if is_flipped:
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
-    return frame
+    return _apply_rotation(frame, rotation)
 
 
 # ============================================================
@@ -916,21 +977,101 @@ def build_subtitle_filter(text, output_width, output_height, font_path=None):
 
 def generate_thumbnail(video_path, output_path, timestamp=None):
     """
-    从视频中提取一帧作为缩略图。
-    默认取视频结束前 hold_seconds 的位置（字已写完、手已离开）。
+    旧版缩略图：直接从视频提取一帧。仅作兼容保留。
+    新代码请用 generate_calligraphy_thumbnail()。
     """
     if timestamp is None:
         info = get_video_info(video_path)
-        # 取 60% 位置的帧作为缩略图
         timestamp = info['duration'] * 0.6
 
     run_ffmpeg([
         'ffmpeg', '-y', '-ss', str(timestamp),
         '-i', video_path,
         '-vframes', '1', '-update', '1',
-        '-q:v', '2',  # 高质量 JPEG
+        '-q:v', '2',
         output_path
     ], "缩略图生成")
+
+
+def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
+                                    output_width=DEFAULT_OUTPUT_WIDTH,
+                                    output_height=DEFAULT_OUTPUT_HEIGHT,
+                                    thumb_fill=0.78):
+    """
+    从已处理的干净帧（已裁剪、缩放、色彩校正）生成精美书法缩略图。
+
+    输入是 1080x1920 的处理后帧（字在白纸上，无手、无字幕）。
+    针对 Shorts/小红书优化：
+    1. 在处理后帧中检测墨迹 → 二次紧裁剪（字占画面 ~78%）
+    2. 缩放回 1080x1920
+    3. 强化对比度（纯白纸 + 浓墨黑）
+    4. 强锐化
+    5. 轻微暗角（引导视线聚焦中心）
+    """
+    import cv2
+    import numpy as np
+
+    frame = cv2.imread(clean_frame_processed_path)
+    if frame is None:
+        print("   ⚠️  无法读取帧")
+        return False
+
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # --- 在已处理帧中检测墨迹（帧已是干净白纸+墨迹，无桌面噪点） ---
+    _, ink_mask = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+    ink_mask = cv2.erode(ink_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    ink_mask = cv2.dilate(ink_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
+
+    contours, _ = cv2.findContours(ink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        print("   ⚠️  缩略图未检测到墨迹，使用中心裁剪")
+        ink = {'cx': w // 2, 'cy': h // 2, 'w': w // 3, 'h': h // 4}
+    else:
+        # 空间聚类：以最大轮廓为锚点
+        valid = sorted(contours, key=cv2.contourArea, reverse=True)
+        anchor = valid[0]
+        ax, ay, aw, ah = cv2.boundingRect(anchor)
+        acx, acy = ax + aw // 2, ay + ah // 2
+        radius = max(aw, ah) * 2
+        clustered = [c for c in valid[:30]
+                     if abs(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] // 2 - acx) < radius
+                     and abs(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] // 2 - acy) < radius
+                     and cv2.contourArea(c) > 30]
+        if clustered:
+            valid = clustered
+        pts = np.vstack(valid)
+        x, y, bw, bh = cv2.boundingRect(pts)
+        ink = {'cx': x + bw // 2, 'cy': y + bh // 2, 'w': bw, 'h': bh}
+
+    # --- 二次紧裁剪：字占画面 thumb_fill ---
+    # 留 5% 边距，避免裁入帧边缘的桌面/纸边噪点
+    margin_y = int(h * 0.05)
+    crop = calculate_crop(
+        ink, w, h, thumb_fill, output_width, output_height,
+        min_scale=1.0, y_min=margin_y, y_max=h - margin_y,
+    )
+
+    # --- ffmpeg：裁剪 + 缩放 + 纯白底 + 强锐化 ---
+    vf_parts = [
+        f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
+        f"scale={output_width}:{output_height}:flags=lanczos",
+        # 纯白底 + 浓墨黑：推亮纸面、拉大黑白反差
+        "eq=brightness=0.10:contrast=1.5:saturation=0.9",
+        # 强锐化（缩略图显示尺寸小，需要锐利）
+        "unsharp=5:5:1.5:3:3:0.0,unsharp=3:3:0.7:3:3:0.0",
+    ]
+
+    run_ffmpeg([
+        'ffmpeg', '-y', '-i', clean_frame_processed_path,
+        '-vf', ','.join(vf_parts),
+        '-q:v', '1',
+        output_path
+    ], "缩略图生成")
+
+    return True
 
 
 # ============================================================
@@ -997,7 +1138,7 @@ def process_video(input_path, output_path, voiceover_path=None,
                   hold_seconds=DEFAULT_HOLD_SECONDS,
                   output_width=DEFAULT_OUTPUT_WIDTH,
                   output_height=DEFAULT_OUTPUT_HEIGHT,
-                  force_flip=None,
+                  force_rotation=None,
                   enable_stabilize=True,
                   enable_color_correct=True,
                   fade_in=DEFAULT_FADE_IN,
@@ -1016,6 +1157,8 @@ def process_video(input_path, output_path, voiceover_path=None,
     print("=" * 60)
 
     tmpdir = tempfile.mkdtemp()
+    clean_frame_raw = None
+    clean_frame_processed = None  # 干净帧处理后路径（用于缩略图）
 
     try:
         # ========================================
@@ -1029,15 +1172,22 @@ def process_video(input_path, output_path, voiceover_path=None,
         # Step 2: 方向检测 (Feature 6)
         # ========================================
         print("\n🔄 Step 2: 检测方向...")
-        if force_flip is not None:
-            is_flipped = force_flip
-            print(f"   手动: {'翻转 180°' if is_flipped else '不翻转'}")
+        if force_rotation is not None:
+            rotation = force_rotation
+            print(f"   手动: {rotation}")
         else:
             orient = detect_orientation(input_path)
-            is_flipped = orient['is_flipped']
-            print(f"   结果: {'翻转 180°' if is_flipped else '正常'} ({orient['confidence']}: {orient['reason']})")
+            rotation = orient['rotation']
+            print(f"   结果: {orient['reason']} ({orient['confidence']})")
             if orient['confidence'] == 'low':
-                print("   ⚠️  置信度低，可用 --flip / --no-flip 手动指定")
+                print("   ⚠️  置信度低，可用 --rotate 手动指定")
+
+        # 90° 旋转后宽高互换
+        if rotation in ('cw90', 'ccw90'):
+            eff_w, eff_h = vi['height'], vi['width']
+        else:
+            eff_w, eff_h = vi['width'], vi['height']
+        print(f"   旋转后尺寸: {eff_w}x{eff_h}")
 
         # ========================================
         # Step 3: 防抖
@@ -1082,21 +1232,17 @@ def process_video(input_path, output_path, voiceover_path=None,
         # Step 4: 墨迹检测
         # ========================================
         print("\n🔍 Step 4: 检测墨迹...")
-        ink = detect_ink_region(stabilized_input, is_flipped)
+        ink = detect_ink_region(stabilized_input, rotation)
 
         # ========================================
-        # Step 5: 计算裁剪参数（约束裁剪框不越过书脊区域）
+        # Step 5: 计算裁剪参数（旋转后书脊永远在顶部 → 排除顶部 30%）
         # ========================================
-        if is_flipped:
-            crop_y_min = int(vi['height'] * 0.30)  # 书在顶部，裁剪不能高于 30%
-            crop_y_max = vi['height']
-        else:
-            crop_y_min = 0
-            crop_y_max = int(vi['height'] * 0.75)  # 书在底部，裁剪不能低于 75%
+        crop_y_min = int(eff_h * 0.30)
+        crop_y_max = eff_h
         crop = calculate_crop(
-            ink, vi['width'], vi['height'],
+            ink, eff_w, eff_h,
             target_fill_ratio, output_width, output_height,
-            y_min=crop_y_min, y_max=crop_y_max
+            y_min=crop_y_min, y_max=crop_y_max,
         )
         sf = crop['scale_factor']
 
@@ -1106,15 +1252,22 @@ def process_video(input_path, output_path, voiceover_path=None,
 
         # ========================================
         # Step 6-8: 构建一体化滤镜链
-        # （翻转 + 裁剪 + 缩放 + 白平衡 + 锐化 + 淡入）
+        # （旋转 + 裁剪 + 缩放 + 白平衡 + 锐化 + 淡入）
         # ========================================
         print(f"\n🎬 Step 6-8: 视频处理...")
         vf_parts = []
 
-        # ① 翻转（使用 vflip+hflip，像素精确，不引入抖动）
-        if is_flipped:
+        # ① 旋转
+        rotation_names = {'none': '不旋转', '180': '180°', 'cw90': '顺时针90°', 'ccw90': '逆时针90°'}
+        if rotation == '180':
             vf_parts.append("vflip,hflip")
-            print("   ✓ 翻转 180°")
+            print(f"   ✓ 旋转 180°")
+        elif rotation == 'cw90':
+            vf_parts.append("transpose=1")
+            print(f"   ✓ 顺时针旋转 90°")
+        elif rotation == 'ccw90':
+            vf_parts.append("transpose=2")
+            print(f"   ✓ 逆时针旋转 90°")
 
         # ④ 裁剪
         vf_parts.append(f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}")
@@ -1164,9 +1317,9 @@ def process_video(input_path, output_path, voiceover_path=None,
 
             # 找到干净的最后一帧（无手）
             print("   检测无手帧...")
-            clean_frame = find_clean_last_frame(stabilized_input, is_flipped)
+            clean_frame = find_clean_last_frame(stabilized_input, rotation)
 
-            # 保存干净帧（已在 find_clean_last_frame 中翻转），用 ffmpeg 处理以保持一致
+            # 保存干净帧（已在 find_clean_last_frame 中旋转），用 ffmpeg 处理以保持一致
             import cv2
             clean_frame_raw = os.path.join(tmpdir, 'clean_raw.png')
             cv2.imwrite(clean_frame_raw, clean_frame)
@@ -1263,6 +1416,9 @@ def process_video(input_path, output_path, voiceover_path=None,
             if not voiceover_path:
                 print(f"\n📝 Step 12: 无旁白，输出静音视频")
 
+        # 保存无字幕视频路径，用于缩略图（只展示字，不含字幕文字）
+        thumb_source_video = current_video
+
         # ========================================
         # Step 11 + 13: 淡出 + 字幕（在最终时长上执行，单次编码）
         # 放在音频合并之后，确保淡出基于完整时长计算
@@ -1316,7 +1472,14 @@ def process_video(input_path, output_path, voiceover_path=None,
         if generate_thumb:
             thumb_path = os.path.splitext(output_path)[0] + '_thumb.jpg'
             print(f"\n🖼️  Step 14: 生成缩略图...")
-            generate_thumbnail(output_path, thumb_path)
+            # 优先用原始分辨率的干净帧（紧裁剪 + 强化对比 + 暗角）
+            if clean_frame_processed and os.path.exists(clean_frame_processed):
+                ok = generate_calligraphy_thumbnail(clean_frame_processed, thumb_path,
+                                                     output_width, output_height)
+            else:
+                ok = False
+            if not ok:
+                generate_thumbnail(thumb_source_video, thumb_path)
             print(f"   ✅ {thumb_path}")
 
         # ========================================
@@ -1334,7 +1497,7 @@ def process_video(input_path, output_path, voiceover_path=None,
         print(f"   大小: {sz:.1f}MB")
 
         steps_done = []
-        if is_flipped: steps_done.append("🔄翻转")
+        if rotation != 'none': steps_done.append(f"🔄{rotation_names[rotation]}")
         if enable_stabilize: steps_done.append("📐防抖")
         steps_done.append("✂️裁剪")
         steps_done.append(f"🔎放大{sf:.1f}x")
@@ -1402,10 +1565,13 @@ def main():
     parser.add_argument('--height', type=int, default=DEFAULT_OUTPUT_HEIGHT,
                         help=f'输出高度 (默认: {DEFAULT_OUTPUT_HEIGHT})')
 
-    # 翻转控制
+    # 旋转控制
+    parser.add_argument('--rotate',
+                        choices=['none', '180', 'cw90', 'ccw90'],
+                        help='手动指定旋转方式（覆盖自动检测）')
     flip = parser.add_mutually_exclusive_group()
-    flip.add_argument('--flip', action='store_true', help='强制翻转 180°')
-    flip.add_argument('--no-flip', action='store_true', help='强制不翻转')
+    flip.add_argument('--flip', action='store_true', help='强制翻转 180°（等同 --rotate 180）')
+    flip.add_argument('--no-flip', action='store_true', help='强制不旋转（等同 --rotate none）')
 
     # 效果开关
     parser.add_argument('--fade-in', type=float, default=DEFAULT_FADE_IN,
@@ -1453,7 +1619,15 @@ def main():
         print("⚠️  同时提供了 --text 和 --voiceover，使用 voiceover 音频（忽略 TTS）")
         tts_text = None
 
-    force_flip = True if args.flip else (False if args.no_flip else None)
+    # --rotate 优先；否则 --flip/--no-flip 兼容
+    if args.rotate:
+        force_rotation = args.rotate
+    elif args.flip:
+        force_rotation = '180'
+    elif args.no_flip:
+        force_rotation = 'none'
+    else:
+        force_rotation = None
 
     check_dependencies()
 
@@ -1465,7 +1639,7 @@ def main():
         hold_seconds=args.hold,
         output_width=args.width,
         output_height=args.height,
-        force_flip=force_flip,
+        force_rotation=force_rotation,
         enable_stabilize=args.stabilize,
         enable_color_correct=not args.no_color_correct,
         fade_in=args.fade_in,
