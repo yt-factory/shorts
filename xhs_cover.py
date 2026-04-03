@@ -439,26 +439,35 @@ def generate_cover(thumb_path: str,
         sx = (cover_width - sw) // 2
         draw.text((sx, sub_y), subtitle, fill=SUBTITLE_COLOR, font=sub_font)
 
-    # --- 品牌印章（右下角，使用自定义印章图片）---
+    # --- 品牌印章（右下角，竖椭圆白文禅字印）---
     if enable_stamp and os.path.exists(STAMP_IMAGE):
         stamp_src = Image.open(STAMP_IMAGE).convert('RGBA')
-        stamp_size = int(cover_width * 0.05)  # 印章宽度约 5%
-        # 等比缩放
-        ratio = stamp_size / stamp_src.width
-        stamp_resized = stamp_src.resize(
-            (stamp_size, int(stamp_src.height * ratio)), Image.LANCZOS
-        )
-        # 设置整体透明度 80%
-        alpha = stamp_resized.split()[3]
-        alpha = alpha.point(lambda a: int(a * 0.80))
-        stamp_resized.putalpha(alpha)
+        # 宽度约 11%（小红书缩略图下辨识度好）
+        stamp_w = int(cover_width * 0.11)
+        ratio = stamp_w / stamp_src.width
+        stamp_h = int(stamp_src.height * ratio)
+        stamp_resized = stamp_src.resize((stamp_w, stamp_h), Image.LANCZOS)
+
+        # 0.5px 高斯模糊模拟石刻"崩边"质感
+        from PIL import ImageFilter
+        stamp_resized = stamp_resized.filter(ImageFilter.GaussianBlur(radius=0.5))
+
+        # 微旋转 -3°（印章钤盖时自然的不完美倾斜）
+        stamp_rotated = stamp_resized.rotate(3, expand=True, resample=Image.BICUBIC)
+
+        # 整体透明度 80%
+        r, g, b, a = stamp_rotated.split()
+        a = a.point(lambda x: int(x * 0.80))
+        stamp_rotated.putalpha(a)
+
         # 右下角定位
-        stamp_margin = int(cover_width * 0.05)
-        stamp_x = cover_width - stamp_margin - stamp_resized.width
-        stamp_y = cover_height - stamp_margin - stamp_resized.height
-        # 叠加
+        margin_x = int(cover_width * 0.05)
+        margin_y = int(cover_height * 0.04)
+        sx = cover_width - margin_x - stamp_rotated.width
+        sy = cover_height - margin_y - stamp_rotated.height
+
         stamp_layer = Image.new('RGBA', (cover_width, cover_height), (0, 0, 0, 0))
-        stamp_layer.paste(stamp_resized, (stamp_x, stamp_y))
+        stamp_layer.paste(stamp_rotated, (sx, sy))
         canvas = Image.alpha_composite(canvas.convert('RGBA'), stamp_layer).convert('RGB')
 
     # --- 保存 ---
