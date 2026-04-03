@@ -39,7 +39,7 @@ BG_COLOR = (245, 240, 235)       # #F5F0EB 米白底色
 DOT_COLOR = (200, 192, 184)      # #C8C0B8 暖灰圆点
 TITLE_COLOR = (45, 42, 38)       # 深棕黑
 SUBTITLE_COLOR = (155, 148, 140) # 暖灰色
-STAMP_COLOR = (180, 60, 50)      # 暗红印章（传统印泥色）
+STAMP_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'seal', 'chan_seal.png')
 
 # 布局：以圆点为锚点，字往上长，文字往下长
 DIVIDER_Y_RATIO = 0.52           # 圆点（视觉中心锚点）
@@ -439,38 +439,26 @@ def generate_cover(thumb_path: str,
         sx = (cover_width - sw) // 2
         draw.text((sx, sub_y), subtitle, fill=SUBTITLE_COLOR, font=sub_font)
 
-    # --- 升级5：品牌印章（右下角"禅"字红印）---
-    if enable_stamp:
-        stamp_size = int(cover_width * 0.04)
-        stamp_margin = int(cover_width * 0.05)
-        stamp_x = cover_width - stamp_margin - stamp_size
-        stamp_y = cover_height - stamp_margin - stamp_size
-
-        # 在 RGBA 临时图层上绘制印章（75% 透明度）
-        stamp_layer = Image.new('RGBA', (cover_width, cover_height), (0, 0, 0, 0))
-        stamp_draw = ImageDraw.Draw(stamp_layer)
-        stamp_alpha = 190  # 75%
-
-        # 方框
-        stamp_draw.rectangle(
-            [stamp_x, stamp_y, stamp_x + stamp_size, stamp_y + stamp_size],
-            outline=(*STAMP_COLOR, stamp_alpha), width=2
+    # --- 品牌印章（右下角，使用自定义印章图片）---
+    if enable_stamp and os.path.exists(STAMP_IMAGE):
+        stamp_src = Image.open(STAMP_IMAGE).convert('RGBA')
+        stamp_size = int(cover_width * 0.05)  # 印章宽度约 5%
+        # 等比缩放
+        ratio = stamp_size / stamp_src.width
+        stamp_resized = stamp_src.resize(
+            (stamp_size, int(stamp_src.height * ratio)), Image.LANCZOS
         )
-
-        # 框内"禅"字
-        stamp_font_size = int(stamp_size * 0.65)
-        stamp_font = _load_font(SERIF_FONT, stamp_font_size, CJK_SC_INDEX)
-        if not stamp_font:
-            stamp_font = _load_font(SANS_FONT, stamp_font_size, CJK_SC_INDEX)
-        if stamp_font:
-            bbox = stamp_draw.textbbox((0, 0), "禅", font=stamp_font)
-            tw = bbox[2] - bbox[0]
-            th = bbox[3] - bbox[1]
-            tx = stamp_x + (stamp_size - tw) // 2
-            ty = stamp_y + (stamp_size - th) // 2 - bbox[1]
-            stamp_draw.text((tx, ty), "禅",
-                            fill=(*STAMP_COLOR, stamp_alpha), font=stamp_font)
-
+        # 设置整体透明度 80%
+        alpha = stamp_resized.split()[3]
+        alpha = alpha.point(lambda a: int(a * 0.80))
+        stamp_resized.putalpha(alpha)
+        # 右下角定位
+        stamp_margin = int(cover_width * 0.05)
+        stamp_x = cover_width - stamp_margin - stamp_resized.width
+        stamp_y = cover_height - stamp_margin - stamp_resized.height
+        # 叠加
+        stamp_layer = Image.new('RGBA', (cover_width, cover_height), (0, 0, 0, 0))
+        stamp_layer.paste(stamp_resized, (stamp_x, stamp_y))
         canvas = Image.alpha_composite(canvas.convert('RGBA'), stamp_layer).convert('RGB')
 
     # --- 保存 ---
