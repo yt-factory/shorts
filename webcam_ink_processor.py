@@ -73,47 +73,62 @@ def detect_paper_region(video_path):
     frame = extract_frame(video_path, 'last')
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    # 亮度扫描法：按行/列中位数区分桌面(暗)和白纸(亮)
+    # 比形态学更鲁棒——不受桌面条纹宽度影响
+    paper_thresh = 180  # 行/列中位数 > 此值 = 白纸
+    row_medians = np.median(gray, axis=1)
+    col_medians = np.median(gray, axis=0)
 
-    best = None
-    # 从高阈值到低阈值，选第一个面积 > 15% 且不触碰上下边缘的结果
-    for thresh in [220, 215, 210, 205, 200, 190]:
-        _, mask = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    paper_rows = row_medians > paper_thresh
+    paper_cols = col_medians > paper_thresh
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
+    # 找到最大连续白纸区域
+    def largest_run(mask):
+        best_start, best_len = 0, 0
+        start, length = 0, 0
+        for i, v in enumerate(mask):
+            if v:
+                if length == 0:
+                    start = i
+                length += 1
+            else:
+                if length > best_len:
+                    best_start, best_len = start, length
+                length = 0
+        if length > best_len:
+            best_start, best_len = start, length
+        return best_start, best_len
 
-        biggest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(biggest)
-        x, y, pw, ph = cv2.boundingRect(biggest)
+    py, ph = largest_run(paper_rows)
+    px, pw = largest_run(paper_cols)
 
-        if area < w * h * 0.15:
-            continue
-
-        # 白纸通常不会顶到画面上边缘（桌面可见）
-        touches_top = y < 10
-        if not touches_top or best is None:
-            best = (x, y, pw, ph, biggest, thresh)
-            if not touches_top:
-                break  # 找到了不触顶的纸张
-
-    if best is None:
+    if ph < h * 0.15 or pw < w * 0.15:
         return None
 
-    x, y, pw, ph, contour, thresh = best
+    x, y = px, py
+    # 缩进 2% 避免纸边
+    shrink = int(min(pw, ph) * 0.02)
+    x += shrink
+    y += shrink
+    pw -= 2 * shrink
+    ph -= 2 * shrink
+
+    if pw <= 0 or ph <= 0:
+        return None
+
+    # 矩形轮廓
+    contour = np.array([
+        [[x, y]], [[x + pw, y]], [[x + pw, y + ph]], [[x, y + ph]]
+    ], dtype=np.int32)
 
     # 调试图
     dbg = frame.copy()
-    cv2.drawContours(dbg, [contour], -1, (0, 255, 0), 3)
-    cv2.rectangle(dbg, (x, y), (x + pw, y + ph), (255, 0, 0), 2)
+    cv2.rectangle(dbg, (x, y), (x + pw, y + ph), (0, 255, 0), 3)
     dp = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'paper_debug.png')
     cv2.imwrite(dp, dbg)
 
-    pct = cv2.contourArea(contour) / (w * h) * 100
-    print(f"   ✅ 白纸: ({x},{y}) {pw}x{ph}, 占画面 {pct:.1f}% (阈值={thresh})")
+    pct = pw * ph / (w * h) * 100
+    print(f"   ✅ 白纸: ({x},{y}) {pw}x{ph}, 占画面 {pct:.1f}%")
     print(f"      调试图: {dp}")
 
     return {'x': x, 'y': y, 'w': pw, 'h': ph, 'contour': contour}
@@ -266,7 +281,7 @@ def find_clean_last_frame_webcam(video_path):
         if skin_ratio < 0.01:
             cap.release()
             print(f"      找到干净帧: 倒数第 {offset} 帧, 肤色 {skin_ratio * 100:.2f}%")
-            return frame
+            return best_frame
 
     cap.release()
     if best_frame is not None:
@@ -335,11 +350,15 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
             target_fill_ratio, output_width, output_height,
             y_min=crop_y_min, y_max=crop_y_max,
         )
-        # 再约束 x 方向不超出白纸
+        # 约束 x 方向不超出白纸（位置 + 宽度都钳位）
         if crop['x'] < crop_x_min:
             crop['x'] = crop_x_min
         if crop['x'] + crop['w'] > crop_x_max:
             crop['x'] = max(crop_x_min, crop_x_max - crop['w'])
+        # 裁剪宽度不超过纸面宽度
+        available_w = crop_x_max - crop['x']
+        if crop['w'] > available_w:
+            crop['w'] = available_w - (available_w % 2)  # ffmpeg 偶数
 
         sf = crop['scale_factor']
 

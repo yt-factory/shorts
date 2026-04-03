@@ -7,7 +7,8 @@ Part of the [YT-Factory](../CLAUDE.md) platform. Processes handwritten calligrap
 | Processor | Source | File | Key Difference |
 |-----------|--------|------|----------------|
 | **Phone** | `ink_video_processor.py` | Phone (back camera, upside-down) | Auto-rotation (180°/90° CW/CCW) based on book edge detection |
-| **Webcam** | `webcam_ink_processor.py` | Webcam (1080p, top-down) | No rotation; paper contour detection to isolate from desk texture |
+| **Webcam** | `webcam_ink_processor.py` | Webcam (4K/1080p, top-down) | No rotation; row/column brightness scan to isolate paper from desk |
+| **XHS Cover** | `xhs_cover.py` | Thumbnail → 小红书封面 (1242×1660) | Ink extraction + anchor-based layout + simplified rendering |
 
 `webcam_ink_processor.py` imports shared functions (ffmpeg utils, TTS, subtitles, color correction, sharpening, etc.) from `ink_video_processor.py`.
 
@@ -53,9 +54,16 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - **Rotation**: Uses `vflip,hflip` for 180° (pixel-exact), `transpose=1`/`transpose=2` for 90° CW/CCW.
 
 **Webcam-specific:**
-- **Paper detection**: Adaptive brightness threshold (220→190) finds white paper on gray desk. Uses filled contour mask (not bounding box) to precisely isolate paper from desk texture.
+- **Paper detection**: Row/column median brightness scan (>180 = paper, <180 = desk). No morphological operations — robust against desk stripe width at any resolution.
 - **Ink detection**: Dark pixels (threshold=80) within paper contour mask. Much lower min area (100px vs 0.3%) since webcam characters are small relative to frame.
 - **No rotation**: Webcam video is always correctly oriented.
+- **Crop constraint bug fixed**: `calculate_crop` now uses `y_max - ch` (not `src_h - ch`) to prevent crop from overflowing paper bounds into desk area.
+
+**XHS Cover (`xhs_cover.py`):**
+- **Ink extraction**: Character-first strategy — find dark contours, filter desk stripes (aspect>5 + frame-spanning), spatial clustering around largest stroke.
+- **Rendering**: Simplified — background replacement to #F5F0EB with 3px Gaussian feathering, optional ×0.9 linear darkening. No Gamma/soft-mask/sharpening (trust input quality).
+- **Layout**: Anchor-based — divider line fixed at 52%, character bottom aligned 3% above divider, title at 58%, subtitle at 66%. All anchors fixed regardless of character size.
+- **Size unification**: Single char = 48% canvas width, multi-char = 70% width. `--char` length determines mode.
 
 ### Constants
 

@@ -22,13 +22,13 @@ import json
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
 # 常量
 # ============================================================
 
-VERSION = "1.0"
+VERSION = "3.0"
 
 # 小红书推荐封面比例 3:4
 COVER_WIDTH = 1242
@@ -41,13 +41,10 @@ DIVIDER_COLOR = (200, 195, 188)  # 淡灰暖色分隔线
 TITLE_COLOR = (45, 42, 38)       # 深棕黑
 SUBTITLE_COLOR = (155, 148, 140) # 暖灰色
 
-# 布局比例（从上到下）
-TOP_MARGIN_RATIO = 0.13          # 顶部留白
-CHAR_ZONE_RATIO = 0.45           # 书法字区域
-DIVIDER_Y_RATIO = 0.62           # 分隔线位置
-TITLE_Y_RATIO = 0.67             # 标题起始位置
-SUBTITLE_Y_RATIO = 0.75          # 副标题位置
-BOTTOM_MARGIN_RATIO = 0.10       # 底部留白
+# 布局：以短横线为锚点，字往上长，文字往下长
+DIVIDER_Y_RATIO = 0.52           # 短横线（视觉中心锚点）
+CHAR_GAP_RATIO = 0.03            # 字底边到短横线的呼吸间距
+TOP_MIN_RATIO = 0.10             # 字顶边不超出此位置
 
 # 书法字占画面宽度比例
 CHAR_FILL_WIDTH = 0.55
@@ -101,7 +98,7 @@ def load_subtitle_font(size: int) -> ImageFont.FreeTypeFont:
 # 书法字提取
 # ============================================================
 
-def extract_calligraphy(thumb_path: str) -> Image.Image:
+def extract_calligraphy(thumb_path: str, char: str = "") -> Image.Image:
     """
     从缩略图中提取纯净的书法字。
 
@@ -114,90 +111,119 @@ def extract_calligraphy(thumb_path: str) -> Image.Image:
     """
     import numpy as np
 
+    import cv2
+
     img = Image.open(thumb_path).convert('RGB')
     arr = np.array(img, dtype=np.float32)
-    gray = np.mean(arr, axis=2).copy()
+    gray = np.mean(arr, axis=2)
     h, w = gray.shape
 
-    # ── Step 1: 边缘清洗 ──
-    # 四边各 8% 区域：非深色像素（灰度>100）全部推白
-    # 目的：消除纸张边缘、桌面阴影，但保留真正的墨迹笔画
-    edge = int(min(w, h) * 0.08)
-    ink_thresh_edge = 100  # 只有 <100 的像素才算墨迹
-    for region in [
-        gray[:edge, :],           # 上
-        gray[h - edge:, :],       # 下
-        gray[:, :edge],           # 左
-        gray[:, w - edge:],       # 右
-    ]:
-        region[region > ink_thresh_edge] = 255.0
+    # ══════════════════════════════════════════════
+    # 两阶段策略：先"找纸"清桌面，再"找字"定位墨迹
+    # ══════════════════════════════════════════════
 
-    # ── Step 2: 背景清洗 ──
-    # Otsu 自适应阈值
+    # ── Stage A: 白纸检测 (OPEN + 填充) ──
+    # OPEN 去除桌面条纹，填充恢复墨迹留下的孔洞
     gray_u8 = np.clip(gray, 0, 255).astype(np.uint8)
-    hist, _ = np.histogram(gray_u8.ravel(), bins=256, range=(0, 256))
-    total = gray_u8.size
-    sum_total = float(np.sum(np.arange(256) * hist))
-    sum_bg, weight_bg = 0.0, 0
-    max_var, threshold = 0.0, 128
-    for t in range(256):
-        weight_bg += hist[t]
-        if weight_bg == 0:
+    # OPEN 参数：kernel=11, iter=2 → 总侵蚀 22px
+    # 足以消除桌面条纹（5-15px 宽），但保留字笔画周围的白纸（30px+）
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    for paper_thresh in [210, 200, 190]:
+        _, pmask = cv2.threshold(gray_u8, paper_thresh, 255, cv2.THRESH_BINARY)
+        pmask = cv2.morphologyEx(pmask, cv2.MORPH_OPEN, kernel_open, iterations=2)
+        contours_p, _ = cv2.findContours(pmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours_p:
             continue
-        weight_fg = total - weight_bg
-        if weight_fg == 0:
-            break
-        sum_bg += t * hist[t]
-        mean_bg = sum_bg / weight_bg
-        mean_fg = (sum_total - sum_bg) / weight_fg
-        var_between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
-        if var_between > max_var:
-            max_var = var_between
-            threshold = t
-    threshold = max(100, min(180, threshold))
+        biggest_p = max(contours_p, key=cv2.contourArea)
+        area_ratio = cv2.contourArea(biggest_p) / (w * h)
+        if not (0.15 < area_ratio < 0.90):
+            continue
+        paper_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(paper_mask, [biggest_p], -1, 255, -1)
+        outside_pixels = gray[paper_mask == 0]
+        # 判断外部是桌面还是纸+墨迹：桌面有大量灰色像素(80-200)，纸+墨几乎没有
+        gray_zone = ((outside_pixels > 80) & (outside_pixels < 200)).mean() if outside_pixels.size > 0 else 0
+        if gray_zone > 0.20:
+            paper_mask = cv2.erode(paper_mask,
+                                   cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10)),
+                                   iterations=1)
+            gray[paper_mask == 0] = 255.0
+            gray_u8 = np.clip(gray, 0, 255).astype(np.uint8)
+            break  # 只在确认桌面纹理时 break
 
-    # 背景→纯白，墨迹→增强对比但保留浓淡层次
-    cleaned = gray.copy()
-    bg_mask = cleaned > threshold
-    cleaned[bg_mask] = 255.0
-    # 墨迹区域：拉伸对比度，映射 [0, threshold] → [0, threshold*0.7]
-    ink_pixels = ~bg_mask
-    if ink_pixels.any():
-        cleaned[ink_pixels] = cleaned[ink_pixels] * 0.7
+    # ── Stage B: 找字 — 直接定位墨迹轮廓 ──
+    _, ink_bin = cv2.threshold(gray_u8, 80, 255, cv2.THRESH_BINARY_INV)
+    ink_bin = cv2.dilate(ink_bin, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=1)
+    contours, _ = cv2.findContours(ink_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # ── Step 3: 墨迹定位 ──
-    # 只检测真正的深色墨迹（< 80），忽略灰色纸张纹理
-    ink_detect = cleaned < 80
-    rows_with_ink = np.any(ink_detect, axis=1)
-    cols_with_ink = np.any(ink_detect, axis=0)
-
-    if not rows_with_ink.any():
+    if not contours:
         margin = min(w, h) // 6
         return img.crop((margin, margin, w - margin, h - margin)).convert('RGBA')
 
-    y_min, y_max = np.where(rows_with_ink)[0][[0, -1]]
-    x_min, x_max = np.where(cols_with_ink)[0][[0, -1]]
+    # ── Step 2: 过滤 — 只保留"笔画级"轮廓 ──
+    # 排除：桌面条纹（极扁，宽高比 > 8）、微小噪点（面积 < 50px）
+    min_area = 50
+    strokes = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+        x, y, cw, ch = cv2.boundingRect(c)
+        aspect = max(cw, ch) / max(min(cw, ch), 1)
+        # 排除桌面条纹：高宽高比 + 横跨画面大部分宽/高
+        if aspect > 5 and (cw > w * 0.6 or ch > h * 0.6):
+            continue
+        strokes.append(c)
 
-    # ── Step 4: 裁出 + 12% 呼吸空间 ──
-    ink_w = x_max - x_min
-    ink_h = y_max - y_min
-    pad_x = int(ink_w * 0.12)
-    pad_y = int(ink_h * 0.12)
+    if not strokes:
+        margin = min(w, h) // 6
+        return img.crop((margin, margin, w - margin, h - margin)).convert('RGBA')
+
+    # ── Step 3: 空间聚类 — 找到主字群 ──
+    # 以最大笔画为锚点，保留距离在 3× 半径内的笔画
+    anchor = max(strokes, key=cv2.contourArea)
+    ax, ay, aw, ah = cv2.boundingRect(anchor)
+    acx, acy = ax + aw // 2, ay + ah // 2
+    # 聚类半径：单字用紧半径避免桌面碎片，多字用宽半径连接多个字
+    if len(char) > 1:
+        radius = max(aw, ah) * 3
+    else:
+        radius = max(aw, ah) * 2.0
+
+    clustered = []
+    for c in strokes:
+        bx, by, bw_c, bh_c = cv2.boundingRect(c)
+        mcx = bx + bw_c // 2
+        mcy = by + bh_c // 2
+        if abs(mcx - acx) < radius and abs(mcy - acy) < radius:
+            clustered.append(c)
+
+    if not clustered:
+        clustered = [anchor]
+
+    # 合并边界框
+    pts = np.vstack(clustered)
+    x_min, y_min, bw, bh = cv2.boundingRect(pts)
+    x_max = x_min + bw
+    y_max = y_min + bh
+
+    # ── Step 4: 裁出 + 12% 呼吸空间 + 边缘保护 ──
+    pad_x = int(bw * 0.12)
+    pad_y = int(bh * 0.12)
     x1 = max(0, x_min - pad_x)
     y1 = max(0, y_min - pad_y)
     x2 = min(w, x_max + pad_x)
     y2 = min(h, y_max + pad_y)
 
-    cropped = cleaned[y1:y2, x1:x2]
+    # 裁出原始灰度（Stage A 已清理桌面，无需二次清理）
+    cropped = gray[y1:y2, x1:x2].copy()
     ch_h, ch_w = cropped.shape
 
     # ── Step 5: 转 RGBA ──
-    # alpha：白色→透明，墨迹→不透明（保留自然浓淡）
-    # 使用 cleaned 灰度值：越黑→alpha 越大
     alpha = np.clip(255.0 - cropped, 0, 255)
-    alpha[alpha < 25] = 0  # 去微弱噪点
+    alpha[alpha < 25] = 0
 
-    # 边缘羽化：4 边各 4% 渐变到透明
+    # 边缘羽化
     feather = max(3, int(min(ch_w, ch_h) * 0.04))
     fade = np.ones((ch_h, ch_w), dtype=np.float32)
     ramp = np.linspace(0, 1, feather)
@@ -206,10 +232,8 @@ def extract_calligraphy(thumb_path: str) -> Image.Image:
     fade[:, :feather] *= ramp[None, :]
     fade[:, ch_w - feather:] *= ramp[None, ::-1]
     alpha *= fade
-
     alpha = np.clip(alpha, 0, 255).astype(np.uint8)
 
-    # RGB：使用清洗后的灰度值作为墨迹颜色（保留笔锋浓淡层次）
     ink_gray = np.clip(cropped, 0, 255).astype(np.uint8)
     result = np.zeros((ch_h, ch_w, 4), dtype=np.uint8)
     result[:, :, 0] = ink_gray
@@ -218,6 +242,53 @@ def extract_calligraphy(thumb_path: str) -> Image.Image:
     result[:, :, 3] = alpha
 
     return Image.fromarray(result, 'RGBA')
+
+
+# ============================================================
+# 墨迹渲染（简化版：信任输入，只做背景替换）
+# ============================================================
+
+def render_ink(gray: 'np.ndarray') -> 'np.ndarray':
+    """
+    简化渲染：背景替换为米白底色 + 可选轻微对比度增强。
+
+    原则：信任输入。脚本是排版工具，不是图像处理工具。
+    只做两件事：
+    1. 灰度 > 200 → 替换为米白底色，阈值边界 3px 高斯羽化
+    2. 如果墨迹不够黑（最暗 > 40），轻微线性加深 ×0.9
+    """
+    import numpy as np
+    import cv2
+
+    gray = gray.astype(np.float64)
+    h, w = gray.shape
+    bg_val = np.mean(BG_COLOR[:3])  # ~240
+
+    # ── 1. 背景替换 + 羽化 ──
+    # 生成 0-1 墨迹权重：灰度 ≤ 197 → 1.0（纯墨迹），≥ 203 → 0.0（纯背景）
+    # 中间 6 级灰度（197-203）做线性过渡，再高斯模糊 3px 消除硬边
+    ink_weight = np.clip((203.0 - gray) / 6.0, 0.0, 1.0)
+    ink_weight_u8 = (ink_weight * 255).astype(np.uint8)
+    ink_weight_smooth = cv2.GaussianBlur(ink_weight_u8, (7, 7), 1.5).astype(np.float64) / 255.0
+
+    # 墨迹像素保持原值，背景像素替换为底色
+    result = gray * ink_weight_smooth + bg_val * (1.0 - ink_weight_smooth)
+
+    # ── 2. 轻微对比度增强（可选）──
+    darkest = float(gray[ink_weight > 0.5].min()) if (ink_weight > 0.5).any() else 255
+    if darkest > 40:
+        # 墨色偏淡，轻微加深（仅对墨迹区域）
+        enhanced = result * 0.9
+        result = enhanced * ink_weight_smooth + result * (1.0 - ink_weight_smooth)
+
+    result = np.clip(result, 0, 255).astype(np.uint8)
+
+    # RGB（微暖色调）
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    rgb[:, :, 0] = result
+    rgb[:, :, 1] = np.clip(result.astype(np.int16) - 1, 0, 255).astype(np.uint8)
+    rgb[:, :, 2] = np.clip(result.astype(np.int16) - 2, 0, 255).astype(np.uint8)
+    return rgb
 
 
 # ============================================================
@@ -231,27 +302,14 @@ def generate_cover(thumb_path: str,
                    output_path: str = "cover.jpg",
                    cover_width: int = COVER_WIDTH,
                    cover_height: int = COVER_HEIGHT):
-    """
-    生成一张小红书风格封面。
-
-    Args:
-        thumb_path: 书法缩略图路径
-        char: 书法字内容（用于文件命名/日志，不叠加到图上）
-        title: 标题文字
-        subtitle: 副标题文字
-        output_path: 输出路径
-    """
-
-    # --- 画布 ---
-    canvas = Image.new('RGB', (cover_width, cover_height), BG_COLOR)
-    draw = ImageDraw.Draw(canvas)
+    """生成小红书/Shorts 封面。"""
+    import numpy as np
 
     # --- 提取书法字 ---
     print(f"   提取书法字...")
-    calligraphy = extract_calligraphy(thumb_path)
+    calligraphy = extract_calligraphy(thumb_path, char)
 
-    # Tight-crop：去掉透明像素的边距，只保留实际墨迹
-    import numpy as np
+    # Tight-crop
     alpha_arr = np.array(calligraphy)[:, :, 3]
     rows_vis = np.any(alpha_arr > 30, axis=1)
     cols_vis = np.any(alpha_arr > 30, axis=0)
@@ -261,43 +319,81 @@ def generate_cover(thumb_path: str,
         calligraphy = calligraphy.crop((tx1, ty1, tx2 + 1, ty2 + 1))
 
     cw, ch = calligraphy.size
-    print(f"   墨迹尺寸: {cw}x{ch}")
+    aspect = cw / max(ch, 1)
+    # 单字 vs 多字：优先用 --char 长度判断，否则用宽高比
+    if len(char) > 1:
+        is_multi = True
+    elif len(char) == 1:
+        is_multi = False
+    else:
+        is_multi = aspect > 2.0 or aspect < 0.3
+    mode = "多字" if is_multi else "单字"
+    print(f"   墨迹尺寸: {cw}x{ch} (宽高比={aspect:.2f}, char='{char}' → {mode}模式)")
 
-    # 强制缩放：宽度约束 vs 高度约束，取较小 scale
-    area_top = int(cover_height * 0.12)
-    area_bot = int(cover_height * 0.62)
-    area_h = area_bot - area_top
+    # --- 锚点布局 ---
+    divider_y = int(cover_height * DIVIDER_Y_RATIO)   # 52%
+    char_gap = int(cover_height * CHAR_GAP_RATIO)      # 3%
+    top_min = int(cover_height * TOP_MIN_RATIO)         # 10%
+    char_bottom = divider_y - char_gap  # 字底边固定位置
 
-    scale_w = (cover_width * CHAR_FILL_WIDTH) / cw
-    scale_h = (area_h * 0.85) / ch  # 字最大占区域高度 85%
+    # 统一目标尺寸
+    if is_multi:
+        max_w = int(cover_width * 0.70)
+        max_h = int(cover_height * 0.40)
+    else:
+        max_w = int(cover_width * 0.48)
+        max_h = int(cover_height * 0.35)
+
+    scale_w = max_w / cw
+    scale_h = max_h / ch
     scale = min(scale_w, scale_h)
-
     target_w = int(cw * scale)
     target_h = int(ch * scale)
 
-    calligraphy_resized = calligraphy.resize(
-        (target_w, target_h), Image.LANCZOS
-    )
+    # 如果字太高（顶边超出 top_min），缩小
+    paste_y = char_bottom - target_h
+    if paste_y < top_min:
+        target_h = char_bottom - top_min
+        scale = target_h / ch
+        target_w = int(cw * scale)
+        target_h = int(ch * scale)
+        paste_y = char_bottom - target_h
 
-    # 强制居中于字区域 (y: 12%~62%)
-    area_center_y = (area_top + area_bot) // 2
     paste_x = (cover_width - target_w) // 2
-    paste_y = area_center_y - target_h // 2
 
     print(f"   缩放后: {target_w}x{target_h} (scale={scale:.2f})")
     print(f"   粘贴位置: ({paste_x}, {paste_y})")
     print(f"   字占画布宽度: {target_w / cover_width * 100:.0f}%")
 
-    # 先画一层米白底作为书法字的背景（覆盖透明区域）
-    bg_layer = Image.new('RGBA', (cover_width, cover_height), (*BG_COLOR, 255))
-    bg_layer.paste(calligraphy_resized, (paste_x, paste_y), calligraphy_resized)
-    canvas = Image.alpha_composite(
-        canvas.convert('RGBA'), bg_layer
-    ).convert('RGB')
+    # --- 灰度合成 ---
+    # 关键：不用 alpha 混合（会稀释墨色），而是直接保留原始灰度值
+    # 只在 alpha 极低的边缘羽化区做过渡
+    cal_arr = np.array(calligraphy)
+    cal_alpha = cal_arr[:, :, 3].astype(np.float64) / 255.0
+    cal_gray = np.mean(cal_arr[:, :, :3].astype(np.float64), axis=2)
+    bg_gray_val = np.mean(BG_COLOR[:3])
+    # alpha > 0.3 → 使用原始灰度（保留墨色）
+    # alpha < 0.05 → 纯背景
+    # 中间 → 平滑过渡
+    blend = np.clip((cal_alpha - 0.05) / 0.25, 0.0, 1.0)
+    composite_gray = cal_gray * blend + bg_gray_val * (1.0 - blend)
+
+    gray_img = Image.fromarray(composite_gray.astype(np.uint8), 'L')
+    gray_resized = gray_img.resize((target_w, target_h), Image.LANCZOS)
+
+    canvas_gray = np.full((cover_height, cover_width), bg_gray_val, dtype=np.float64)
+    gray_arr = np.array(gray_resized, dtype=np.float64)
+    py1, py2 = max(0, paste_y), min(cover_height, paste_y + target_h)
+    px1, px2 = max(0, paste_x), min(cover_width, paste_x + target_w)
+    sy1, sy2 = py1 - paste_y, py1 - paste_y + (py2 - py1)
+    sx1, sx2 = px1 - paste_x, px1 - paste_x + (px2 - px1)
+    canvas_gray[py1:py2, px1:px2] = gray_arr[sy1:sy2, sx1:sx2]
+
+    canvas_rgb = render_ink(canvas_gray)
+    canvas = Image.fromarray(canvas_rgb, 'RGB')
     draw = ImageDraw.Draw(canvas)
 
-    # --- 分隔线 ---
-    divider_y = int(cover_height * DIVIDER_Y_RATIO)
+    # --- 短横线（固定锚点）---
     line_w = int(cover_width * 0.12)
     line_x = (cover_width - line_w) // 2
     draw.line(
@@ -305,30 +401,26 @@ def generate_cover(thumb_path: str,
         fill=DIVIDER_COLOR, width=2
     )
 
-    # --- 标题 ---
+    # --- 标题（短横线下方固定位置）---
+    title_y = divider_y + int(cover_height * 0.06)
     if title:
-        # 动态字号：标题越长字越小
-        base_size = int(cover_width * 0.045)  # ~56px
+        base_size = int(cover_width * 0.045)
         if len(title) > 12:
             base_size = int(base_size * 0.85)
         if len(title) > 18:
             base_size = int(base_size * 0.85)
 
         title_font = load_title_font(base_size)
-        title_y = int(cover_height * TITLE_Y_RATIO)
-
-        # 居中
         bbox = draw.textbbox((0, 0), title, font=title_font)
         tw = bbox[2] - bbox[0]
         tx = (cover_width - tw) // 2
         draw.text((tx, title_y), title, fill=TITLE_COLOR, font=title_font)
 
     # --- 副标题 ---
+    sub_y = title_y + int(cover_height * 0.08)
     if subtitle:
-        sub_size = int(cover_width * 0.028)  # ~35px
+        sub_size = int(cover_width * 0.028)
         sub_font = load_subtitle_font(sub_size)
-        sub_y = int(cover_height * SUBTITLE_Y_RATIO)
-
         bbox = draw.textbbox((0, 0), subtitle, font=sub_font)
         sw = bbox[2] - bbox[0]
         sx = (cover_width - sw) // 2
@@ -427,7 +519,6 @@ def main():
                         help=f'封面宽度 (默认: {COVER_WIDTH})')
     parser.add_argument('--height', type=int, default=COVER_HEIGHT,
                         help=f'封面高度 (默认: {COVER_HEIGHT})')
-
     args = parser.parse_args()
 
     if args.batch:

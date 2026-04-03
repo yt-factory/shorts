@@ -254,12 +254,14 @@ def extract_frame(video_path, position='last'):
 # ============================================================
 
 def _edge_book_score(gray_region):
-    """计算一个区域的书脊得分（深色像素比例 + 边缘密度）"""
+    """计算一个区域的书脊得分。
+    深色像素权重 ×10：书脊有大面积暗色文字，纸边/阴影只有薄线条。
+    """
     import cv2
     import numpy as np
     dark = float(np.mean(gray_region < 100))
     edges = float(np.mean(cv2.Canny(gray_region, 50, 150)))
-    return dark + edges
+    return dark * 10 + edges
 
 
 def detect_orientation(video_path):
@@ -321,11 +323,8 @@ def detect_orientation(video_path):
         'left': 'cw90',     # 左侧→顶部 = 顺时针 90°
     }
 
-    if confidence == 'low':
-        # 低置信度默认 180°（最常见的手机倒置拍摄场景）
-        rotation = '180'
-    else:
-        rotation = rotation_map[raw_book_edge]
+    # 始终使用检测到的最高分边作为旋转依据（即使置信度低）
+    rotation = rotation_map[raw_book_edge]
 
     edge_names = {'top': '顶部', 'bottom': '底部', 'left': '左侧', 'right': '右侧'}
     rotation_names = {'none': '不旋转', '180': '旋转180°', 'cw90': '顺时针90°', 'ccw90': '逆时针90°'}
@@ -377,7 +376,7 @@ def detect_ink_region(video_path, rotation='none'):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     # 旋转后书脊永远在顶部 → 排除顶部 30%
-    a_top, a_bot = int(h * 0.30), int(h * 0.95)
+    a_top, a_bot = int(h * 0.38), int(h * 0.95)
     a_left, a_right = 0, w
 
     gc = gray[a_top:a_bot, a_left:a_right]
@@ -1019,8 +1018,9 @@ def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # --- 在已处理帧中检测墨迹（帧已是干净白纸+墨迹，无桌面噪点） ---
-    _, ink_mask = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
+    # --- 在已处理帧中检测墨迹 ---
+    # 阈值 80：只检测真正的深色墨迹，忽略色彩校正后的灰色纸张纹理
+    _, ink_mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
     ink_mask = cv2.erode(ink_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     ink_mask = cv2.dilate(ink_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
 
@@ -1048,7 +1048,7 @@ def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
 
     # --- 二次紧裁剪：字占画面 thumb_fill ---
     # 留 5% 边距，避免裁入帧边缘的桌面/纸边噪点
-    margin_y = int(h * 0.05)
+    margin_y = int(h * 0.02)
     crop = calculate_crop(
         ink, w, h, thumb_fill, output_width, output_height,
         min_scale=1.0, y_min=margin_y, y_max=h - margin_y,
@@ -1121,7 +1121,7 @@ def calculate_crop(ink, src_w, src_h, fill_ratio, out_w, out_h,
     ch -= ch % 2
 
     cx = max(0, min(ink['cx'] - cw//2, src_w - cw))
-    cy = max(y_min, min(ink['cy'] - ch//2, src_h - ch))
+    cy = max(y_min, min(ink['cy'] - ch//2, y_max - ch))
 
     return {
         'x': cx, 'y': cy, 'w': cw, 'h': ch,
@@ -1237,7 +1237,7 @@ def process_video(input_path, output_path, voiceover_path=None,
         # ========================================
         # Step 5: 计算裁剪参数（旋转后书脊永远在顶部 → 排除顶部 30%）
         # ========================================
-        crop_y_min = int(eff_h * 0.30)
+        crop_y_min = int(eff_h * 0.38)
         crop_y_max = eff_h
         crop = calculate_crop(
             ink, eff_w, eff_h,
