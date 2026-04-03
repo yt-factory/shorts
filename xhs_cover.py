@@ -448,17 +448,12 @@ def generate_cover(thumb_path: str,
         stamp_h = int(stamp_src.height * ratio)
         stamp_resized = stamp_src.resize((stamp_w, stamp_h), Image.LANCZOS)
 
-        # 0.5px 高斯模糊模拟石刻"崩边"质感
-        from PIL import ImageFilter
-        stamp_resized = stamp_resized.filter(ImageFilter.GaussianBlur(radius=0.5))
-
-        # 微旋转 -3°（印章钤盖时自然的不完美倾斜）
-        stamp_rotated = stamp_resized.rotate(3, expand=True, resample=Image.BICUBIC)
-
+        # 印章图片已预处理（崩边、石纹、旋转2.5°、终值模糊），直接使用
         # 整体透明度 80%
-        r, g, b, a = stamp_rotated.split()
+        r, g, b, a = stamp_resized.split()
         a = a.point(lambda x: int(x * 0.80))
-        stamp_rotated.putalpha(a)
+        stamp_resized.putalpha(a)
+        stamp_rotated = stamp_resized
 
         # 右下角定位
         margin_x = int(cover_width * 0.05)
