@@ -28,22 +28,22 @@ from PIL import Image, ImageDraw, ImageFont
 # 常量
 # ============================================================
 
-VERSION = "3.0"
+VERSION = "4.0"
 
 # 小红书推荐封面比例 3:4
 COVER_WIDTH = 1242
 COVER_HEIGHT = 1660
 
-# 米白底色（模拟宣纸质感，不是纯白）
-BG_COLOR = (245, 240, 235)       # #F5F0EB
-INK_COLOR = (30, 28, 26)         # 近纯黑，微暖
-DIVIDER_COLOR = (200, 195, 188)  # 淡灰暖色分隔线
+# 色彩
+BG_COLOR = (245, 240, 235)       # #F5F0EB 米白底色
+DOT_COLOR = (200, 192, 184)      # #C8C0B8 暖灰圆点
 TITLE_COLOR = (45, 42, 38)       # 深棕黑
 SUBTITLE_COLOR = (155, 148, 140) # 暖灰色
+STAMP_COLOR = (180, 60, 50)      # 暗红印章（传统印泥色）
 
-# 布局：以短横线为锚点，字往上长，文字往下长
-DIVIDER_Y_RATIO = 0.52           # 短横线（视觉中心锚点）
-CHAR_GAP_RATIO = 0.03            # 字底边到短横线的呼吸间距
+# 布局：以圆点为锚点，字往上长，文字往下长
+DIVIDER_Y_RATIO = 0.52           # 圆点（视觉中心锚点）
+CHAR_GAP_RATIO = 0.03            # 字底边到圆点的呼吸间距
 TOP_MIN_RATIO = 0.10             # 字顶边不超出此位置
 
 # 书法字占画面宽度比例
@@ -281,14 +281,14 @@ def render_ink(gray: 'np.ndarray') -> 'np.ndarray':
         enhanced = result * 0.9
         result = enhanced * ink_weight_smooth + result * (1.0 - ink_weight_smooth)
 
-    result = np.clip(result, 0, 255).astype(np.uint8)
+    result = np.clip(result, 0, 255)
 
-    # RGB（微暖色调）
-    rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    rgb[:, :, 0] = result
-    rgb[:, :, 1] = np.clip(result.astype(np.int16) - 1, 0, 255).astype(np.uint8)
-    rgb[:, :, 2] = np.clip(result.astype(np.int16) - 2, 0, 255).astype(np.uint8)
-    return rgb
+    # RGB：暖黑色调 — 越黑的像素暖色偏移越大，白色区域不受影响
+    darkness = 1.0 - (result / 255.0)
+    r = np.clip(result + 8 * darkness, 0, 255).astype(np.uint8)
+    g = np.clip(result + 2 * darkness, 0, 255).astype(np.uint8)
+    b = np.clip(result - 3 * darkness, 0, 255).astype(np.uint8)
+    return np.stack([r, g, b], axis=-1)
 
 
 # ============================================================
@@ -301,7 +301,9 @@ def generate_cover(thumb_path: str,
                    subtitle: str = "极客禅·墨",
                    output_path: str = "cover.jpg",
                    cover_width: int = COVER_WIDTH,
-                   cover_height: int = COVER_HEIGHT):
+                   cover_height: int = COVER_HEIGHT,
+                   enable_texture: bool = True,
+                   enable_stamp: bool = True):
     """生成小红书/Shorts 封面。"""
     import numpy as np
 
@@ -381,7 +383,18 @@ def generate_cover(thumb_path: str,
     gray_img = Image.fromarray(composite_gray.astype(np.uint8), 'L')
     gray_resized = gray_img.resize((target_w, target_h), Image.LANCZOS)
 
+    # --- 画布 + 纸张纹理 ---
     canvas_gray = np.full((cover_height, cover_width), bg_gray_val, dtype=np.float64)
+
+    # 升级1：纸张纹理（柔和高斯噪声模拟纸纤维起伏）
+    if enable_texture:
+        import cv2
+        noise = np.random.normal(loc=bg_gray_val, scale=3,
+                                 size=(cover_height, cover_width)).astype(np.uint8)
+        noise = cv2.GaussianBlur(noise, (0, 0), 40)  # sigma=40 → 柔和起伏
+        canvas_gray = canvas_gray * 0.94 + noise.astype(np.float64) * 0.06
+
+    # 贴入墨迹
     gray_arr = np.array(gray_resized, dtype=np.float64)
     py1, py2 = max(0, paste_y), min(cover_height, paste_y + target_h)
     px1, px2 = max(0, paste_x), min(cover_width, paste_x + target_w)
@@ -393,18 +406,18 @@ def generate_cover(thumb_path: str,
     canvas = Image.fromarray(canvas_rgb, 'RGB')
     draw = ImageDraw.Draw(canvas)
 
-    # --- 短横线（固定锚点）---
-    line_w = int(cover_width * 0.12)
-    line_x = (cover_width - line_w) // 2
-    draw.line(
-        [(line_x, divider_y), (line_x + line_w, divider_y)],
-        fill=DIVIDER_COLOR, width=2
+    # --- 升级2：圆点分隔符（替代直线）---
+    dot_r = 4
+    draw.ellipse(
+        [cover_width // 2 - dot_r, divider_y - dot_r,
+         cover_width // 2 + dot_r, divider_y + dot_r],
+        fill=DOT_COLOR
     )
 
-    # --- 标题（短横线下方固定位置）---
+    # --- 升级4：标题（加大字号）---
     title_y = divider_y + int(cover_height * 0.06)
     if title:
-        base_size = int(cover_width * 0.045)
+        base_size = int(cover_width * 0.058)  # ~72px（之前 0.045 ≈ 56px）
         if len(title) > 12:
             base_size = int(base_size * 0.85)
         if len(title) > 18:
@@ -416,7 +429,7 @@ def generate_cover(thumb_path: str,
         tx = (cover_width - tw) // 2
         draw.text((tx, title_y), title, fill=TITLE_COLOR, font=title_font)
 
-    # --- 副标题 ---
+    # --- 升级3：副标题（简化为"极客禅·墨"）---
     sub_y = title_y + int(cover_height * 0.08)
     if subtitle:
         sub_size = int(cover_width * 0.028)
@@ -425,6 +438,40 @@ def generate_cover(thumb_path: str,
         sw = bbox[2] - bbox[0]
         sx = (cover_width - sw) // 2
         draw.text((sx, sub_y), subtitle, fill=SUBTITLE_COLOR, font=sub_font)
+
+    # --- 升级5：品牌印章（右下角"禅"字红印）---
+    if enable_stamp:
+        stamp_size = int(cover_width * 0.04)
+        stamp_margin = int(cover_width * 0.05)
+        stamp_x = cover_width - stamp_margin - stamp_size
+        stamp_y = cover_height - stamp_margin - stamp_size
+
+        # 在 RGBA 临时图层上绘制印章（75% 透明度）
+        stamp_layer = Image.new('RGBA', (cover_width, cover_height), (0, 0, 0, 0))
+        stamp_draw = ImageDraw.Draw(stamp_layer)
+        stamp_alpha = 190  # 75%
+
+        # 方框
+        stamp_draw.rectangle(
+            [stamp_x, stamp_y, stamp_x + stamp_size, stamp_y + stamp_size],
+            outline=(*STAMP_COLOR, stamp_alpha), width=2
+        )
+
+        # 框内"禅"字
+        stamp_font_size = int(stamp_size * 0.65)
+        stamp_font = _load_font(SERIF_FONT, stamp_font_size, CJK_SC_INDEX)
+        if not stamp_font:
+            stamp_font = _load_font(SANS_FONT, stamp_font_size, CJK_SC_INDEX)
+        if stamp_font:
+            bbox = stamp_draw.textbbox((0, 0), "禅", font=stamp_font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            tx = stamp_x + (stamp_size - tw) // 2
+            ty = stamp_y + (stamp_size - th) // 2 - bbox[1]
+            stamp_draw.text((tx, ty), "禅",
+                            fill=(*STAMP_COLOR, stamp_alpha), font=stamp_font)
+
+        canvas = Image.alpha_composite(canvas.convert('RGBA'), stamp_layer).convert('RGB')
 
     # --- 保存 ---
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -490,35 +537,24 @@ def main():
   python3 xhs_cover.py --thumb tea_thumb.jpg --char "茶" \\
       --title "赵州禅师只说三个字" -o tea_cover.jpg
 
-  # 含副标题
-  python3 xhs_cover.py --thumb xi_thumb.jpg --char "息" \\
-      --title "它是意识和无意识之间的桥" \\
-      --subtitle "极客禅·墨｜程序员写书法" -o xi_cover.jpg
-
   # 批量生成
   python3 xhs_cover.py --batch covers.json -o output_dir/
+
+  # 无印章/无纹理
+  python3 xhs_cover.py --thumb tea_thumb.jpg --char "茶" --no-stamp --no-texture -o clean.jpg
         """
     )
 
-    # 单张模式
     parser.add_argument('--thumb', help='书法缩略图路径')
-    parser.add_argument('--char', default='', help='书法字内容（用于日志）')
+    parser.add_argument('--char', default='', help='书法字内容')
     parser.add_argument('--title', default='', help='标题文字')
-    parser.add_argument('--subtitle', default='极客禅·墨',
-                        help='副标题文字 (默认: 极客禅·墨)')
-
-    # 批量模式
+    parser.add_argument('--subtitle', default='极客禅·墨', help='副标题 (默认: 极客禅·墨)')
     parser.add_argument('--batch', help='批量配置 JSON 文件路径')
-
-    # 输出
-    parser.add_argument('--output', '-o', default='cover.jpg',
-                        help='输出路径（单张: 文件路径，批量: 目录路径）')
-
-    # 尺寸
-    parser.add_argument('--width', type=int, default=COVER_WIDTH,
-                        help=f'封面宽度 (默认: {COVER_WIDTH})')
-    parser.add_argument('--height', type=int, default=COVER_HEIGHT,
-                        help=f'封面高度 (默认: {COVER_HEIGHT})')
+    parser.add_argument('--output', '-o', default='cover.jpg', help='输出路径')
+    parser.add_argument('--width', type=int, default=COVER_WIDTH)
+    parser.add_argument('--height', type=int, default=COVER_HEIGHT)
+    parser.add_argument('--no-stamp', action='store_true', help='不加印章')
+    parser.add_argument('--no-texture', action='store_true', help='不加纸张纹理')
     args = parser.parse_args()
 
     if args.batch:
@@ -535,6 +571,8 @@ def main():
             title=args.title, subtitle=args.subtitle,
             output_path=args.output,
             cover_width=args.width, cover_height=args.height,
+            enable_texture=not args.no_texture,
+            enable_stamp=not args.no_stamp,
         )
     else:
         parser.print_help()
