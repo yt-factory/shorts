@@ -7,7 +7,7 @@ Part of the [YT-Factory](../CLAUDE.md) platform. Processes handwritten calligrap
 | Processor | Source | File | Key Difference |
 |-----------|--------|------|----------------|
 | **Phone** | `ink_video_processor.py` | Phone (back camera, upside-down) | Auto-rotation (180°/90° CW/CCW) based on book edge detection |
-| **Webcam** | `webcam_ink_processor.py` | Webcam (4K/1080p, top-down) | No rotation; row/column brightness scan to isolate paper from desk |
+| **Webcam** | `webcam_ink_processor.py` | Webcam (4K/1080p, top-down) | No rotation; Otsu + connected-components paper detection; skin-masked ink detection |
 | **XHS Cover** | `xhs_cover.py` | Thumbnail → 小红书封面 (1242×1660) | Ink extraction + anchor-based layout + simplified rendering |
 
 `webcam_ink_processor.py` imports shared functions (ffmpeg utils, TTS, subtitles, color correction, sharpening, etc.) from `ink_video_processor.py`.
@@ -46,6 +46,8 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - **Color correction**: `eq` filter in YUV space (brightness/contrast only), NOT `curves=all` (distorts skin tones).
 - **Sharpening**: Dual-pass unsharp mask. Strength scales with zoom factor.
 - **TTS**: Edge TTS (free, no API key). Auto-adjusts speaking rate to fit within Shorts time budget.
+  - **TTS budget = video duration, NOT remaining time to 60s.** Audio is mixed at `t=0` and plays simultaneously with the video, not appended after. Setting budget to `SHORTS_MAX_DURATION - cur_dur` (the old bug) would compress 121 chars into ~15s for a 45s video, finishing the narration when only ~36% of writing was done. Correct budget is `min(cur_dur, SHORTS_MAX_DURATION - 1)`.
+- **Calligraphy thumbnail (`generate_calligraphy_thumbnail`)**: Second-pass tight crop on the clean processed frame. Filters out edge-touching contours with extreme aspect ratio (color-correction artifacts at frame borders) before clustering, otherwise they get pulled into the bbox and shift the crop toward the frame edge.
 - **Font**: Default 楷体 (simkai.ttf) via WSL Windows fonts path.
 
 **Phone-specific:**
@@ -54,8 +56,13 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - **Rotation**: Uses `vflip,hflip` for 180° (pixel-exact), `transpose=1`/`transpose=2` for 90° CW/CCW.
 
 **Webcam-specific:**
-- **Paper detection**: Row/column median brightness scan (>180 = paper, <180 = desk). No morphological operations — robust against desk stripe width at any resolution.
-- **Ink detection**: Dark pixels (threshold=80) within paper contour mask. Much lower min area (100px vs 0.3%) since webcam characters are small relative to frame.
+- **Paper detection**: **Otsu threshold + 25×25 morphological opening + largest connected component.** Replaced the row/column median scan because median fundamentally fails when paper covers <50% of frame area (4K source with paper in one corner) — desk pixels dominate the median and the algorithm collapses to a tiny "purely white" strip. Otsu is light-invariant; CC finds the largest white blob regardless of size.
+- **Ink detection**: Dark pixels (threshold=80) within the paper contour mask, with two extra filters:
+  1. **Skin masking**: A dilated YCrCb skin mask is *subtracted* from the ink mask. The writer's hand is in nearly every webcam frame and its finger shadows/nail outlines fall below the dark threshold; without this, the hand becomes the largest "ink" contour and the cluster anchors on the wrong location.
+  2. **Paper-edge artifact filter**: Contours that touch the paper bound (within 30 px) **and** have aspect ratio > 2.5 are dropped. Paper-edge folds/shadows form long thin strips along the edge (e.g. `hui.mp4` had a 42×163 strip with area ~5500 — bigger than any character stroke at 4K) that would otherwise win the largest-area anchor selection.
+- **Clean frame search (`find_clean_last_frame_webcam`)**: Two-pass search across the last 90 frames with **adaptive** brightness threshold (skip frames below 85% of the search-window max). Necessary for two cases:
+  1. Re-processing a previously-processed video (its trailing 30 frames are a fade-out — all 0% skin but black);
+  2. Sources where the paper itself is dim (e.g. `dao_v2.mp4` max brightness is only ~190, so a fixed 220 threshold would reject every frame). The adaptive ratio handles both `xi.mp4` (max ≈ 247) and `dao_v2.mp4` (max ≈ 190) without per-source tuning.
 - **No rotation**: Webcam video is always correctly oriented.
 - **Crop constraint bug fixed**: `calculate_crop` now uses `y_max - ch` (not `src_h - ch`) to prevent crop from overflowing paper bounds into desk area.
 

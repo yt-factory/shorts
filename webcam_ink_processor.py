@@ -61,7 +61,11 @@ def detect_paper_region(video_path):
     检测画面中的白纸区域。
 
     Webcam 场景：白纸放在灰色桌面上。
-    自适应阈值：从高到低尝试，选择不触碰帧边缘且面积合理的最佳结果。
+    使用 Otsu 自适应阈值 + 形态学开运算 + 连通域分析：
+    - Otsu 自动找最佳的"亮/暗"分界，比固定阈值更鲁棒
+    - 开运算去除桌面条纹和小亮斑（kernel 25x25 足以消除常见条纹）
+    - 取最大连通域作为纸张
+    适合纸张占画面比例较小（<50%）的场景，比中位数扫描更鲁棒。
     返回白纸轮廓（用于生成精确遮罩）和外接矩形。
 
     Returns:
@@ -73,39 +77,27 @@ def detect_paper_region(video_path):
     frame = extract_frame(video_path, 'last')
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # 亮度扫描法：按行/列中位数区分桌面(暗)和白纸(亮)
-    # 比形态学更鲁棒——不受桌面条纹宽度影响
-    paper_thresh = 180  # 行/列中位数 > 此值 = 白纸
-    row_medians = np.median(gray, axis=1)
-    col_medians = np.median(gray, axis=0)
 
-    paper_rows = row_medians > paper_thresh
-    paper_cols = col_medians > paper_thresh
+    # Otsu 阈值找出"亮"区域（纸 + 浅色物体）
+    _, white_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 找到最大连续白纸区域
-    def largest_run(mask):
-        best_start, best_len = 0, 0
-        start, length = 0, 0
-        for i, v in enumerate(mask):
-            if v:
-                if length == 0:
-                    start = i
-                length += 1
-            else:
-                if length > best_len:
-                    best_start, best_len = start, length
-                length = 0
-        if length > best_len:
-            best_start, best_len = start, length
-        return best_start, best_len
+    # 形态学开运算去除小噪点和细桌面条纹
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
 
-    py, ph = largest_run(paper_rows)
-    px, pw = largest_run(paper_cols)
+    # 连通域分析，最大的白色块即纸张
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
+    if n_labels < 2:
+        return None
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x = int(stats[largest, cv2.CC_STAT_LEFT])
+    y = int(stats[largest, cv2.CC_STAT_TOP])
+    pw = int(stats[largest, cv2.CC_STAT_WIDTH])
+    ph = int(stats[largest, cv2.CC_STAT_HEIGHT])
 
     if ph < h * 0.15 or pw < w * 0.15:
         return None
 
-    x, y = px, py
     # 缩进 2% 避免纸边
     shrink = int(min(pw, ph) * 0.02)
     x += shrink
@@ -185,6 +177,17 @@ def detect_ink_webcam(video_path, paper=None):
     _, ink_mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
     ink_mask = cv2.bitwise_and(ink_mask, analysis_mask)
 
+    # 排除手部：手指阴影/指甲轮廓会被当作墨迹，用肤色检测剔除
+    # 肤色区域膨胀 25px 覆盖手指边缘的暗轮廓
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    skin_mask = cv2.inRange(ycrcb,
+                            np.array([0, 133, 77], dtype=np.uint8),
+                            np.array([255, 173, 127], dtype=np.uint8))
+    skin_mask = cv2.dilate(skin_mask,
+                           cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)),
+                           iterations=2)
+    ink_mask = cv2.bitwise_and(ink_mask, cv2.bitwise_not(skin_mask))
+
     # 轻度膨胀连接笔画（webcam 字小，不能太激进）
     ink_mask = cv2.dilate(ink_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=1)
 
@@ -200,8 +203,28 @@ def detect_ink_webcam(video_path, paper=None):
     mn = 100
     mx = cv2.countNonZero(analysis_mask) * 0.15
 
-    valid = [c for c in contours if mn < cv2.contourArea(c) < mx]
+    # 纸张边缘伪影过滤：贴近纸边 + 长宽比极端的轮廓通常是纸张边缘
+    # 阴影/折痕，不是字。比如 hui.mp4 的左纸边一条 42x163 的暗条
+    # （aspect 3.88）面积比真正的字笔画还大，会被误选为聚类锚点。
+    edge_margin = 30  # 距纸边 30px 内算"贴边"
+    aspect_max = 2.5  # 长宽比超过此阈值 + 贴边 → 视为伪影
+
+    def _is_paper_edge_artifact(c):
+        cx_, cy_, cw_, ch_ = cv2.boundingRect(c)
+        touches_edge = (
+            cx_ - a_left < edge_margin
+            or a_right - (cx_ + cw_) < edge_margin
+            or cy_ - a_top < edge_margin
+            or a_bot - (cy_ + ch_) < edge_margin
+        )
+        aspect = max(cw_, ch_) / max(1, min(cw_, ch_))
+        return touches_edge and aspect > aspect_max
+
+    valid = [c for c in contours
+             if mn < cv2.contourArea(c) < mx
+             and not _is_paper_edge_artifact(c)]
     if not valid:
+        # 全部被过滤时退回最大轮廓
         valid = [max(contours, key=cv2.contourArea)]
 
     # 空间聚类：以最大轮廓为锚点，只保留距离在 3 倍半径内的轮廓
@@ -250,44 +273,74 @@ def detect_ink_webcam(video_path, paper=None):
 
 def find_clean_last_frame_webcam(video_path):
     """
-    从视频末尾向前搜索，找到无手的帧。
-    与手机版相同逻辑，但不需要旋转。
+    从视频末尾向前搜索，找到 (a) 无手 且 (b) 非淡出（亮度足够）的帧。
+
+    淡出检查很关键：若输入是已经处理过、末尾带 fade-out 的视频
+    （比如重复加工旧 output），最后 ~1s 的帧都是淡到全黑的，
+    肤色比例都是 0% 但内容也是黑的——必须跳过这些帧。
+
+    采用「自适应亮度阈值」：先扫一遍记录每帧亮度，取搜索范围内的
+    最大亮度作为参考，凡是低于 85% 最大亮度的判定为淡出区跳过。
+    这样既能处理 xi.mp4 (max≈247) 也能处理 dao_v2.mp4 (max≈184)
+    这种纸面本身偏暗的源。
+
+    搜索范围 90 帧（约 3s）覆盖 fade + 部分静止画面区。
     """
     import cv2
     import numpy as np
 
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    SEARCH_FRAMES = 90
 
-    best_frame = None
-    min_skin_ratio = 1.0
-
-    for offset in range(1, min(31, total)):
+    # Pass 1: 收集每帧的亮度（轻量，仅 grayscale 均值）
+    brightness_by_offset = {}
+    for offset in range(1, min(SEARCH_FRAMES + 1, total)):
         cap.set(cv2.CAP_PROP_POS_FRAMES, total - offset)
         ret, frame = cap.read()
         if not ret:
             continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness_by_offset[offset] = float(np.mean(gray))
 
+    if not brightness_by_offset:
+        cap.release()
+        return extract_frame(video_path, 'last')
+
+    max_bright = max(brightness_by_offset.values())
+    brightness_floor = max_bright * 0.85  # 自适应阈值
+    qualifying = [o for o, b in brightness_by_offset.items() if b >= brightness_floor]
+
+    # Pass 2: 在合格帧中找肤色最少的（手最干净的）
+    best_frame = None
+    best_skin = 1.0
+    best_offset = None
+    for offset in sorted(qualifying):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total - offset)
+        ret, frame = cap.read()
+        if not ret:
+            continue
         ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
         lower = np.array([0, 133, 77], dtype=np.uint8)
         upper = np.array([255, 173, 127], dtype=np.uint8)
         skin_mask = cv2.inRange(ycrcb, lower, upper)
         skin_ratio = float(np.mean(skin_mask > 0))
 
-        if skin_ratio < min_skin_ratio:
-            min_skin_ratio = skin_ratio
+        if skin_ratio < best_skin:
+            best_skin = skin_ratio
             best_frame = frame.copy()
+            best_offset = offset
 
         if skin_ratio < 0.01:
-            cap.release()
-            print(f"      找到干净帧: 倒数第 {offset} 帧, 肤色 {skin_ratio * 100:.2f}%")
-            return best_frame
+            break  # 完全无手，提前结束
 
     cap.release()
     if best_frame is not None:
-        print(f"      最佳帧: 肤色 {min_skin_ratio * 100:.2f}%")
+        print(f"      找到干净帧: 倒数第 {best_offset} 帧, 肤色 {best_skin * 100:.2f}%, "
+              f"亮度 {brightness_by_offset[best_offset]:.0f} (max {max_bright:.0f})")
         return best_frame
 
+    print("      ⚠️  未找到合格帧，回退到最后一帧")
     return extract_frame(video_path, 'last')
 
 
@@ -447,7 +500,13 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
         if tts_text and not voiceover_path:
             print(f"\n🗣️  Step 9: TTS 语音合成...")
             cur_dur = get_video_info(current_video)['duration']
-            tts_budget = SHORTS_MAX_DURATION - cur_dur
+            # 旁白与视频「同时」播放（混音于 t=0），不是接在视频后。
+            # 所以预算应为视频长度本身，让旁白以自然语速覆盖书写过程；
+            # 上限 SHORTS_MAX_DURATION-1 防止旁白延长后超 60s。
+            # （此前误用 SHORTS_MAX_DURATION-cur_dur，把旁白挤进剩余时间，
+            #  例如 hui.mp4 视频 45s → 预算 15s → 121 字被压成 14.9s 极速念完，
+            #  字才写到 1/3 旁白就结束了。）
+            tts_budget = min(cur_dur, SHORTS_MAX_DURATION - 1)
             print(f"   视频: {cur_dur:.0f}s, 旁白预算: {tts_budget:.0f}s")
             tts_audio_path, tts_srt_path = generate_tts(
                 tts_text, tts_budget, tmpdir, voice=tts_voice,

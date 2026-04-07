@@ -1026,12 +1026,26 @@ def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
 
     contours, _ = cv2.findContours(ink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # 排除帧边缘伪影：色彩校正/锐化会在帧边产生 1-2px 暗条，
+    # 被聚类拉到 y=0 时会让二次裁剪偏向画面顶部。
+    edge = 3
+
+    def _is_edge_artifact(c):
+        cx, cy, cw_, ch_ = cv2.boundingRect(c)
+        touches_edge = (cx <= edge or cy <= edge
+                        or cx + cw_ >= w - edge or cy + ch_ >= h - edge)
+        aspect = max(cw_, ch_) / max(1, min(cw_, ch_))
+        return touches_edge and aspect > 4  # 紧贴边缘且细长 → 伪影
+
     if not contours:
         print("   ⚠️  缩略图未检测到墨迹，使用中心裁剪")
         ink = {'cx': w // 2, 'cy': h // 2, 'w': w // 3, 'h': h // 4}
     else:
         # 空间聚类：以最大轮廓为锚点
-        valid = sorted(contours, key=cv2.contourArea, reverse=True)
+        valid = sorted([c for c in contours if not _is_edge_artifact(c)],
+                       key=cv2.contourArea, reverse=True)
+        if not valid:
+            valid = sorted(contours, key=cv2.contourArea, reverse=True)
         anchor = valid[0]
         ax, ay, aw, ah = cv2.boundingRect(anchor)
         acx, acy = ax + aw // 2, ay + ah // 2
@@ -1358,7 +1372,10 @@ def process_video(input_path, output_path, voiceover_path=None,
         if tts_text and not voiceover_path:
             print(f"\n🗣️  Step 11.5: TTS 语音合成...")
             cur_dur = get_video_info(current_video)['duration']
-            tts_budget = SHORTS_MAX_DURATION - cur_dur
+            # 旁白与视频「同时」播放（混音于 t=0），不是接在视频后。
+            # 预算 = 视频长度，让旁白以自然语速覆盖书写过程；
+            # 上限 SHORTS_MAX_DURATION-1 防止延长后超 60s。
+            tts_budget = min(cur_dur, SHORTS_MAX_DURATION - 1)
             print(f"   视频: {cur_dur:.0f}s, Shorts上限: {SHORTS_MAX_DURATION}s, 旁白预算: {tts_budget:.0f}s")
             tts_audio_path, tts_srt_path = generate_tts(
                 tts_text, tts_budget, tmpdir,
