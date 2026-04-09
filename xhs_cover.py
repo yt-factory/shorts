@@ -46,9 +46,6 @@ DIVIDER_Y_RATIO = 0.52           # 圆点（视觉中心锚点）
 CHAR_GAP_RATIO = 0.03            # 字底边到圆点的呼吸间距
 TOP_MIN_RATIO = 0.10             # 字顶边不超出此位置
 
-# 书法字占画面宽度比例
-CHAR_FILL_WIDTH = 0.55
-
 # 字体
 SERIF_FONT = '/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc'
 SANS_FONT = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
@@ -426,6 +423,15 @@ def generate_cover(thumb_path: str,
         title_font = load_title_font(base_size)
         bbox = draw.textbbox((0, 0), title, font=title_font)
         tw = bbox[2] - bbox[0]
+
+        # 标题过长时自动缩小字号，确保不超出画面（留 5% 左右边距）
+        max_title_w = int(cover_width * 0.90)
+        while tw > max_title_w and base_size > 28:
+            base_size -= 2
+            title_font = load_title_font(base_size)
+            bbox = draw.textbbox((0, 0), title, font=title_font)
+            tw = bbox[2] - bbox[0]
+
         tx = (cover_width - tw) // 2
         draw.text((tx, title_y), title, fill=TITLE_COLOR, font=title_font)
 

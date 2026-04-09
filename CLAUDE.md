@@ -65,12 +65,15 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
   2. Sources where the paper itself is dim (e.g. `dao_v2.mp4` max brightness is only ~190, so a fixed 220 threshold would reject every frame). The adaptive ratio handles both `xi.mp4` (max ≈ 247) and `dao_v2.mp4` (max ≈ 190) without per-source tuning.
 - **No rotation**: Webcam video is always correctly oriented.
 - **Crop constraint bug fixed**: `calculate_crop` now uses `y_max - ch` (not `src_h - ch`) to prevent crop from overflowing paper bounds into desk area.
+- **X-direction crop clamping preserves aspect ratio**: When paper is narrower than the calculated crop, width clamping also recalculates height to maintain 9:16 ratio — prevents stretched/distorted output.
+- **Debug images conditional**: `--debug` flag controls whether `paper_debug.png` / `ink_webcam_debug.png` are written (default: off).
 
 **XHS Cover (`xhs_cover.py`):**
 - **Ink extraction**: Character-first strategy — find dark contours, filter desk stripes (aspect>5 + frame-spanning), spatial clustering around largest stroke.
 - **Rendering**: Simplified — background replacement to #F5F0EB with 3px Gaussian feathering, optional ×0.9 linear darkening. No Gamma/soft-mask/sharpening (trust input quality).
 - **Layout**: Anchor-based — divider line fixed at 52%, character bottom aligned 3% above divider, title at 58%, subtitle at 66%. All anchors fixed regardless of character size.
 - **Size unification**: Single char = 48% canvas width, multi-char = 70% width. `--char` length determines mode.
+- **Title auto-sizing**: Font size reduces by character count (>12, >18) then further by rendered width measurement until title fits within 90% canvas width. Prevents clipping for long titles (>24 chars).
 
 ### Constants
 
@@ -105,6 +108,9 @@ make xhs-cover IN=xi.mp4 CHAR="息" TITLE="标题"
 
 # Options
 make shorts-help / make webcam-help / make xhs-help
+
+# Debug (saves detection overlay images)
+cd shorts && uv run python3 webcam_ink_processor.py files/input/xi.mp4 -o files/output/xi.mp4 --debug
 
 # Shared
 make short-import IN=zhi.mp4                     # Win Downloads → WSL input
