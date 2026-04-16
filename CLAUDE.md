@@ -56,24 +56,40 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - **Rotation**: Uses `vflip,hflip` for 180° (pixel-exact), `transpose=1`/`transpose=2` for 90° CW/CCW.
 
 **Webcam-specific:**
-- **Paper detection**: **Otsu threshold + 25×25 morphological opening + largest connected component.** Replaced the row/column median scan because median fundamentally fails when paper covers <50% of frame area (4K source with paper in one corner) — desk pixels dominate the median and the algorithm collapses to a tiny "purely white" strip. Otsu is light-invariant; CC finds the largest white blob regardless of size.
-- **Ink detection**: Dark pixels (threshold=80) within the paper contour mask, with two extra filters:
-  1. **Skin masking**: A dilated YCrCb skin mask is *subtracted* from the ink mask. The writer's hand is in nearly every webcam frame and its finger shadows/nail outlines fall below the dark threshold; without this, the hand becomes the largest "ink" contour and the cluster anchors on the wrong location.
-  2. **Paper-edge artifact filter**: Contours that touch the paper bound (within 30 px) **and** have aspect ratio > 2.5 are dropped. Paper-edge folds/shadows form long thin strips along the edge (e.g. `hui.mp4` had a 42×163 strip with area ~5500 — bigger than any character stroke at 4K) that would otherwise win the largest-area anchor selection.
-- **Clean frame search (`find_clean_last_frame_webcam`)**: Two-pass search across the last 90 frames with **adaptive** brightness threshold (skip frames below 85% of the search-window max). Necessary for two cases:
-  1. Re-processing a previously-processed video (its trailing 30 frames are a fade-out — all 0% skin but black);
-  2. Sources where the paper itself is dim (e.g. `dao_v2.mp4` max brightness is only ~190, so a fixed 220 threshold would reject every frame). The adaptive ratio handles both `xi.mp4` (max ≈ 247) and `dao_v2.mp4` (max ≈ 190) without per-source tuning.
-- **No rotation**: Webcam video is always correctly oriented.
-- **Crop constraint bug fixed**: `calculate_crop` now uses `y_max - ch` (not `src_h - ch`) to prevent crop from overflowing paper bounds into desk area.
-- **X-direction crop clamping preserves aspect ratio**: When paper is narrower than the calculated crop, width clamping also recalculates height to maintain 9:16 ratio — prevents stretched/distorted output.
-- **Debug images conditional**: `--debug` flag controls whether `paper_debug.png` / `ink_webcam_debug.png` are written (default: off).
+- **Shared module (`ink_extraction.py`)**: `flat_field_correct` (illumination normalization), `background_subtract_mask` (Otsu on diff with min-floor), `classify_medium` (histogram-based brush/pencil/empty), `remove_ruled_lines` (two-layer: projection detect + narrow subtract). Zero-cost on plain white paper.
+- **Writing medium (`--medium`)**: `brush` / `pencil` / `auto` (default). `auto` runs `classify_medium` on the darkest 1% of flat-field-corrected paper pixels: median < 55 → brush, ≥ 200 → empty (error), else pencil. Replaces the fragile "try brush, fall back on pencil" loop that was fooled by finger shadows.
+  - **brush**: Global threshold 80 on `flat_gray`. Success requires ≥1 contour with area > 1000 AND median gray < 60 (real ink, not shadow).
+  - **pencil**: `bg_subtract_mask ∪ threshold<200` on flat_gray — union handles both ruled-paper (bg_subtract wins) and pure white paper (bg_subtract's dilation pulls pencil into the "clean paper" estimate and misses ~90% of strokes; simple threshold rescues). Then `remove_ruled_lines` (projection-detect + ±3px subtract), single-pixel connected-component filter, dense-cluster focus picking the blob with highest `mask_density / aspect^1.5`. Returns the cluster bbox as one synthetic contour (stops downstream area>100 filter from shredding thin pencil strokes).
+  - **Manual override (`--char-region`)**: Skip auto-detection, specify character region directly. Format: `"cx,cy"` (auto-sizes to ¼ frame), `"cx,cy,w,h"`, or `"x:y:w:h"`. Numbers <1 = frame fraction; ≥1 = pixels.
+- **Paper detection**: Otsu + 25×25 morphological opening + largest connected component. Light-invariant, works when paper occupies <50% of the frame.
+- **Paper mask erode scales with resolution**: `max(15, min(h,w)//60)` kernel × 2 iterations. 1080p → 36px total; 4K → 72px. Fixed-15px was letting wood-grain texture bleed past the paper boundary at 4K.
+- **Skin masking**: A dilated YCrCb skin mask is subtracted from the ink mask. The writer's hand is in nearly every webcam frame; without this, the hand becomes the largest "ink" contour.
+- **Paper-edge artifact filter**: Contours within 30 px of paper edge AND aspect ratio > 2.5 are dropped (paper folds/shadows).
+- **Clean frame search — two separate paths (video vs cover)**:
+  1. `find_clean_last_frame_webcam`: last 90 frames, adaptive brightness floor (85% of window max) to skip fade-outs and dim-paper sources, then 8-frame median composite of the lowest-skin candidates (relative ranking — no absolute 2% threshold). Used for the **hold-still video tail**.
+  2. `find_best_cover_frame`: **full-video scan** (1.5 fps sample + dense tail of last 30 frames). Writers often lift hand briefly only in the last <1s; pure sampling would miss that. Metric is **skin coverage over the character bbox** (direct "hand off the character" signal), NOT ink_area — hand/arm shadow creates false ink signal that inflates ink_area when the hand is on the character. `char_ink ≥ 500` is an existence check. Top-8 by skin_over_char get BGR-reread and median-composited. Returns None if <3 candidates; caller falls back to hold-still frame. Adds ~8s to a 25s 4K video.
+- **Crop constraint bug fixed**: `calculate_crop` uses `y_max - ch` (not `src_h - ch`).
+- **X-direction crop clamping preserves aspect ratio** when paper is narrower than the calculated crop.
+- **Debug images conditional**: `--debug` controls `paper_debug.png` / `ink_webcam_debug.png`.
+
+**Pencil thumbnail rendering (`generate_calligraphy_thumbnail` in `ink_video_processor.py`, used by webcam too):**
+- Brush keeps the historical `eq=brightness=0.10:contrast=1.5`. Pencil would wash out under that (strokes at 180-210 + paper at 220+ → both pushed to 240+).
+- Pencil switches to `curves=all='0/0 0.5/0.15 0.7/0.1 1/1'` — non-linear map: 128→38, 180→25, paper near-255 untouched. Preserves faint strokes while keeping paper clean.
 
 **XHS Cover (`xhs_cover.py`):**
-- **Ink extraction**: Character-first strategy — find dark contours, filter desk stripes (aspect>5 + frame-spanning), spatial clustering around largest stroke.
-- **Rendering**: Simplified — background replacement to #F5F0EB with 3px Gaussian feathering, optional ×0.9 linear darkening. No Gamma/soft-mask/sharpening (trust input quality).
-- **Layout**: Anchor-based — divider line fixed at 52%, character bottom aligned 3% above divider, title at 58%, subtitle at 66%. All anchors fixed regardless of character size.
-- **Size unification**: Single char = 48% canvas width, multi-char = 70% width. `--char` length determines mode.
-- **Title auto-sizing**: Font size reduces by character count (>12, >18) then further by rendered width measurement until title fits within 90% canvas width. Prevents clipping for long titles (>24 chars).
+- **Ink extraction**: Stage A white-paper detect → **Stage A.5 flat-field correct** → Stage B `classify_medium` + brush/pencil extract on `flat_gray`. Pencil uses simple `flat<220` threshold (works because flat-field pushes paper to ~255) plus `remove_ruled_lines`.
+- **Alpha from `flat_cropped`, not `cropped`** — flat-field has already removed paper shadows, so alpha directly reflects ink density (no false-ink shadow residue).
+- **CLAHE on pencil's alpha source**: `cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))` applied to `flat_cropped` before computing alpha. Pencil strokes often land in 230-245, giving alpha=10-25 (near-transparent); CLAHE pulls them to 60-200, alpha becomes meaningfully opaque. Brush skips CLAHE (already has strong contrast, CLAHE would amplify paper-fiber noise).
+- **Quality gate**: `p95 - p1` of `flat_cropped` measures real contrast (p95-p5 undershoots for sparse faint strokes because p5 stays near paper). `<25` raises ValueError with remediation hints; `<55` on pencil sets `auto_override_style='pencil-bold'`.
+- **Render priority**: user `--cover-style` > `auto_override_style` > medium default (brush→brush, pencil→pencil-zen).
+- **`render_ink` adaptive thresholds**: `_bg_floor = p95 - 3`, `_ink_cap = max(p5_of_dark_pixels + 5, _bg_floor - 50)`. Hardcoded 205/190 would zero-out `ink_weight` on pencil thumbs (strokes at 230+ all above 205), making any dynamic-range stretch a no-op. Adaptive thresholds ride the actual histogram.
+- **`render_ink` cover styles**:
+  - `'brush'` — x0.9 microcontrast, no range stretch
+  - `'pencil-zen'` (pencil default) — adaptive target_dark: darkest<100→55 (lightly stretched "禅意灰"), <160→40, ≥160→25 (effectively pencil-bold)
+  - `'pencil-bold'` — always target_dark=25 (max contrast, brush-like)
+- **Layout**: divider at 52%, character bottom 3% above divider, title 58%, subtitle 66%. Fixed anchors regardless of char size.
+- **Size**: single char = 48% canvas width, multi-char = 70% (`--char` length determines mode).
+- **Title auto-sizing**: reduces by char count, then by rendered width until within 90% canvas width.
 
 ### Constants
 
@@ -98,6 +114,17 @@ make short-full IN=guan.mp4 CHAR="观" TITLE="标题" TEXT="旁白"  # With TTS
 
 # Webcam: one-shot
 make webcam-full IN=xi.mp4 CHAR="息" TITLE="它是意识和无意识之间的桥"
+
+# Webcam: pencil mode (flat-field + bg_subtract∪threshold + ruled-line removal)
+make webcam-full IN=she.mp4 CHAR="舍" TITLE="标题" MEDIUM=pencil
+
+# Webcam: faint pencil on lined paper — manually specify character region
+# REGION="cx,cy" (center, auto-sized) | "cx,cy,w,h" | "x:y:w:h" — numbers <1 = frame fraction
+make webcam-full IN=she.mp4 CHAR="舍" TITLE="标题" MEDIUM=pencil REGION="0.55,0.5"
+
+# Override cover rendering style (A/B testing pencil treatments)
+# pencil-zen (default, adaptive) | pencil-bold (max contrast) | brush
+make webcam-full IN=she.mp4 CHAR="舍" TITLE="标题" MEDIUM=pencil COVER_STYLE=pencil-bold
 
 # Process only (no import/export/cover)
 make short IN=zhi.mp4
@@ -129,4 +156,6 @@ make short-export IN=zhi.mp4                     # WSL output → Win Downloads
 - Book spine detection relies on fixed 30% exclusion zone; books taller than 30% of frame may still appear
 - Ink detection may include book text when character is written very close to book spine (mitigated by white paper mask but not perfect)
 - Edge TTS only returns SentenceBoundary (not WordBoundary) for Chinese — subtitles are per-sentence, not per-word
+- Pencil cover depends on the writer briefly lifting hand at end. `find_best_cover_frame` requires ≥3 frames with low skin_over_char; if the writer keeps their hand on the page the entire video, even the best-picked frames will have the hand occluding the character and median composite can't remove it.
+- For extremely faint pencil (reflectance diff <15%), the bbox may still underestimate the full character; use `--char-region` to override.
 - `main.py` is a scaffold placeholder, not used

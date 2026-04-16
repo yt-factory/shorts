@@ -995,7 +995,8 @@ def generate_thumbnail(video_path, output_path, timestamp=None):
 def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
                                     output_width=DEFAULT_OUTPUT_WIDTH,
                                     output_height=DEFAULT_OUTPUT_HEIGHT,
-                                    thumb_fill=0.78):
+                                    thumb_fill=0.78,
+                                    medium='auto'):
     """
     从已处理的干净帧（已裁剪、缩放、色彩校正）生成精美书法缩略图。
 
@@ -1018,13 +1019,53 @@ def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # --- 在已处理帧中检测墨迹 ---
-    # 阈值 80：只检测真正的深色墨迹，忽略色彩校正后的灰色纸张纹理
-    _, ink_mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
-    ink_mask = cv2.erode(ink_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
-    ink_mask = cv2.dilate(ink_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
+    # --- 在已处理帧中检测笔迹 ---
+    # brush: 全局阈值 80（毛笔墨色深）
+    # pencil: 自适应阈值（局部对比度，对铅笔/淡墨稳健）
+    # auto: 先 brush 后 pencil
+    def _brush_thumb():
+        _, im = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+        im = cv2.erode(im, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+        im = cv2.dilate(im, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
+        cs, _ = cv2.findContours(im, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return cs, im
 
-    contours, _ = cv2.findContours(ink_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def _pencil_thumb():
+        block_size = max(31, (min(h, w) // 20) | 1)
+        im = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV,
+            block_size, 15
+        )
+        # 去除 ruled paper 横/竖线
+        line_len = max(50, min(h, w) // 30)
+        h_lines = cv2.morphologyEx(im, cv2.MORPH_OPEN,
+                                   cv2.getStructuringElement(cv2.MORPH_RECT, (line_len, 1)))
+        v_lines = cv2.morphologyEx(im, cv2.MORPH_OPEN,
+                                   cv2.getStructuringElement(cv2.MORPH_RECT, (1, line_len)))
+        lines = cv2.dilate(cv2.bitwise_or(h_lines, v_lines),
+                           cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+        im = cv2.bitwise_and(im, cv2.bitwise_not(lines))
+        im = cv2.morphologyEx(im, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+        im = cv2.dilate(im, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
+        cs, _ = cv2.findContours(im, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return cs, im
+
+    if medium == 'brush':
+        attempts = [_brush_thumb]
+    elif medium == 'pencil':
+        attempts = [_pencil_thumb]
+    else:
+        attempts = [_brush_thumb, _pencil_thumb]
+
+    contours, ink_mask = [], None
+    for fn in attempts:
+        cs, im = fn()
+        if any(cv2.contourArea(c) > 100 for c in cs):
+            contours, ink_mask = cs, im
+            break
+    else:
+        contours, ink_mask = cs, im  # type: ignore[possibly-undefined]
 
     # 排除帧边缘伪影：色彩校正/锐化会在帧边产生 1-2px 暗条，
     # 被聚类拉到 y=0 时会让二次裁剪偏向画面顶部。
@@ -1068,13 +1109,19 @@ def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
         min_scale=1.0, y_min=margin_y, y_max=h - margin_y,
     )
 
-    # --- ffmpeg：裁剪 + 缩放 + 纯白底 + 强锐化 ---
+    # --- ffmpeg：裁剪 + 缩放 + 调色 + 强锐化 ---
+    # 毛笔（墨色 <50）：linear eq brightness+contrast 仍然最优
+    # 铅笔（字 180-210、纸 220-240）：linear eq 会把笔画和纸面一起推到 240+
+    #   → 改用 curves 做非线性映射：把 180 灰度段推到 25，纸面 >250 保持不动。
+    # 对照点：0/0（黑不变）, 0.5/0.15（中灰压到深灰）, 0.7/0.1（180→25）, 1/1（白不变）
+    if medium == 'pencil':
+        tone_filter = "curves=all='0/0 0.5/0.15 0.7/0.1 1/1'"
+    else:
+        tone_filter = "eq=brightness=0.10:contrast=1.5:saturation=0.9"
     vf_parts = [
         f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
         f"scale={output_width}:{output_height}:flags=lanczos",
-        # 纯白底 + 浓墨黑：推亮纸面、拉大黑白反差
-        "eq=brightness=0.10:contrast=1.5:saturation=0.9",
-        # 强锐化（缩略图显示尺寸小，需要锐利）
+        tone_filter,
         "unsharp=5:5:1.5:3:3:0.0,unsharp=3:3:0.7:3:3:0.0",
     ]
 
