@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-极客禅·墨 — Webcam 视频处理器 v1.0
+极客禅·墨 — Phone 视频处理器 v1.0
 
-Webcam 版本：视频已正确朝向，书本在左侧，白纸在灰色桌面上。
-不需要旋转检测，只需裁剪白纸区域并居中墨迹。
+手机贴近纸拍摄：画面基本就是纸（~99% 覆盖）、字信号强（对比度 80+ 灰度级）、
+无旋转 metadata（像素已按字正朝上排列）。
+
+vs webcam_ink_processor.py 的核心差异：
+  - 不做 Otsu 大块查找：画面就是纸，sanity check 式检测
+  - 支持 --rotate 参数（手机横拍时可能需要 cw/ccw/180）
+  - 对强信号场景优化：更大 fill_ratio、面积阈值上调、呼吸空间下调
+  - 假设视频 setup 相对理想，管线更简单
 
 处理流水线：
-  ① 检测白纸区域
-  ② 墨迹检测（在白纸区域内）
-  ③ 裁剪居中（以字为中心，9:16 竖屏）
-  ④ 放大（lanczos 高质量缩放）
-  ⑤ 白平衡/亮度校正
-  ⑥ 锐化
-  ⑦ 淡入/淡出
-  ⑧ 去除背景音
-  ⑨ 拼接静止画面
-  ⑩ 合并旁白/TTS（可选）
-  ⑪ 叠加字幕（可选）
-  ⑫ 生成缩略图（可选）
-
-用法：
-  python3 webcam_ink_processor.py input.mp4 -o output.mp4
-  python3 webcam_ink_processor.py input.mp4 -o output.mp4 --text "旁白"
+  ① (可选) rotate 预处理                     -- 新
+  ② 纸面 sanity check（而非 Otsu 大块查找）  -- 新
+  ③ 笔迹检测（强信号，面积 >500 即可）       -- 调整
+  ④ 裁剪居中、放大（字占比 0.75 ~ 0.8）
+  ⑤-⑫ 同 webcam 版本（色彩、锐化、淡入、静止、TTS、字幕、封面）
 """
 
 import argparse
@@ -33,43 +28,103 @@ import shutil
 # 共享图像处理（平场校正、背景差分、介质分类、精确去线）
 import ink_extraction as ie
 
-# 复用手机版的共享工具函数
+# 复用公共工具函数
 from ink_video_processor import (
     check_dependencies, get_video_info, get_audio_duration,
     run_ffmpeg, extract_frame, extract_last_frame,
     create_still_video, concat_videos,
     build_color_correction_filter, build_sharpen_filter,
     build_subtitle_filter, build_srt_subtitle_filter,
-    normalize_audio, generate_tts, split_sentences, sample_paper_brightness,
-    find_cjk_font, generate_thumbnail, generate_calligraphy_thumbnail, calculate_crop,
-    DEFAULT_OUTPUT_WIDTH, DEFAULT_OUTPUT_HEIGHT, DEFAULT_FILL_RATIO,
+    normalize_audio, generate_tts, sample_paper_brightness,
+    generate_thumbnail, generate_calligraphy_thumbnail, calculate_crop,
+    DEFAULT_OUTPUT_WIDTH, DEFAULT_OUTPUT_HEIGHT,
     DEFAULT_HOLD_SECONDS, DEFAULT_FADE_IN, DEFAULT_FADE_OUT,
-    DEFAULT_MIN_SCALE, TARGET_LUFS, SHORTS_MAX_DURATION, DEFAULT_FONT,
-    DEFAULT_TTS_VOICE, DEFAULT_TTS_BUFFER, CHARS_PER_SECOND,
+    TARGET_LUFS, SHORTS_MAX_DURATION, DEFAULT_FONT,
+    DEFAULT_TTS_VOICE,
 )
 
 
 VERSION = "1.0"
 
+# Phone 场景覆盖面积 > 90%（几乎就是纸），字信号强，填得更满
+# webcam 默认 0.60 — phone 因为 bbox 精度高、字信号强，可以到 0.75
+PHONE_FILL_RATIO = 0.75
+
+# Phone 场景字大，不同于 webcam 的 100px
+PHONE_MIN_INK_AREA = 500
+
+# 呼吸空间 15%（vs webcam 25%）— 字已占画面较大部分，多余 padding 会过度缩字
+PHONE_BREATHING = 0.15
+
 
 # ============================================================
-# Webcam 专用：白纸区域检测
+# Phone 专用：旋转预处理（替代 webcam 没有的步骤）
 # ============================================================
 
-def detect_paper_region(video_path, debug=False):
+def rotate_video_if_needed(video_path: str, rotate: str, tmpdir: str) -> str:
     """
-    检测画面中的白纸区域。
+    手机横拍、倒拍或拍反了时用此步骤把画面摆正。
 
-    Webcam 场景：白纸放在灰色桌面上。
-    使用 Otsu 自适应阈值 + 形态学开运算 + 连通域分析：
-    - Otsu 自动找最佳的"亮/暗"分界，比固定阈值更鲁棒
-    - 开运算去除桌面条纹和小亮斑（kernel 25x25 足以消除常见条纹）
-    - 取最大连通域作为纸张
-    适合纸张占画面比例较小（<50%）的场景，比中位数扫描更鲁棒。
-    返回白纸轮廓（用于生成精确遮罩）和外接矩形。
+    vs webcam: webcam 朝向固定，不需要此步骤。
+
+    Args:
+        video_path: 原始视频路径
+        rotate: 'none' | 'cw' | 'ccw' | '180'
+        tmpdir: 临时目录（存放 rotated.mp4）
 
     Returns:
-        dict: {'x', 'y', 'w', 'h', 'contour': np.ndarray}，检测失败返回 None
+        预处理后的视频路径（none 时即原路径）
+    """
+    if rotate == 'none':
+        return video_path
+
+    # ffmpeg transpose 参考：https://ffmpeg.org/ffmpeg-filters.html#transpose-1
+    #   transpose=1 → 顺时针 90°
+    #   transpose=2 → 逆时针 90°
+    #   两次 transpose=1 → 180°（比 hflip,vflip 保守但等价）
+    vf = {
+        'cw': 'transpose=1',
+        'ccw': 'transpose=2',
+        '180': 'transpose=1,transpose=1',
+    }[rotate]
+
+    out = os.path.join(tmpdir, 'rotated.mp4')
+    run_ffmpeg([
+        'ffmpeg', '-y', '-i', video_path,
+        '-vf', vf,
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+        '-an',
+        out
+    ], f"视频 rotate ({rotate})")
+    print(f"   ✅ 已 rotate: {rotate}")
+    return out
+
+
+# ============================================================
+# Phone 专用：纸面 sanity check（替代 webcam 的 Otsu 大块查找）
+# ============================================================
+
+def detect_paper_phone(video_path: str, debug: bool = False) -> dict:
+    """
+    手机场景：画面基本就是纸。此处做 sanity check + 异物剥离，
+    **不找纸边**（通常不存在纸边）、**不用 Otsu**（会把纸内明暗切开）。
+
+    vs webcam 的 detect_paper_region:
+        webcam 场景：纸只占画面 ~50%、外周是桌面，必须用 Otsu + 连通域找最大亮块。
+        phone 场景：纸占画面 ~99%，判断「整体是纸」即可。
+
+    阈值基于 she.mp4 实测（paper mean≈158, std≈7.6）校准，**比初始设计的
+    180/30 更宽松**——实际手机自动白平衡可能把白纸压到 150-170 灰度。
+    关键判别信号是 std 很小（<25），说明画面只有一个主导灰度（纸面）。
+
+    Returns:
+        dict: {
+            'mode': 'full-frame' | 'with-obstruction' | 'center-fallback',
+            'mask': np.ndarray (H, W) uint8 0/255,  # 被认为是纸的像素
+            'confidence': 'high' | 'medium' | 'low',
+            'stats': {'mean', 'std'},
+        }
     """
     import cv2
     import numpy as np
@@ -78,81 +133,86 @@ def detect_paper_region(video_path, debug=False):
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Otsu 阈值找出"亮"区域（纸 + 浅色物体）
-    _, white_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mean = float(np.mean(gray))
+    std = float(np.std(gray))
 
-    # 形态学开运算去除小噪点和细桌面条纹
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+    # Case 1: 整体就是纸（最常见路径）
+    # 宽松阈值：mean > 140（覆盖 she.mp4 的 158），std < 25（纸面均匀）
+    if mean > 140 and std < 25:
+        mask = np.full((h, w), 255, dtype=np.uint8)
+        print(f"   ✅ 全纸模式: mean={mean:.0f}, std={std:.0f} (整画面视为纸)")
+        return {
+            'mode': 'full-frame',
+            'mask': mask,
+            'confidence': 'high',
+            'stats': {'mean': mean, 'std': std},
+        }
 
-    # 连通域分析，最大的白色块即纸张
-    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
-    if n_labels < 2:
-        return None
-    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    x = int(stats[largest, cv2.CC_STAT_LEFT])
-    y = int(stats[largest, cv2.CC_STAT_TOP])
-    pw = int(stats[largest, cv2.CC_STAT_WIDTH])
-    ph = int(stats[largest, cv2.CC_STAT_HEIGHT])
+    # Case 2: 大体是纸但有异物（手/笔尖/阴影残留）
+    # 用「高于 mean-std 的像素」近似纸面，然后 MORPH_CLOSE 把字/笔画的暗洞回填
+    if mean > 120:
+        paper_pixels = (gray > mean - std).astype(np.uint8) * 255
+        # 31×31 闭运算：字的笔画（1-10px 宽）会被回填到纸面
+        paper_pixels = cv2.morphologyEx(
+            paper_pixels, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (31, 31))
+        )
+        coverage = float(np.mean(paper_pixels > 0))
+        if coverage > 0.80:
+            print(f"   ⚠️  有异物模式: mean={mean:.0f}, std={std:.0f}, 纸面覆盖 {coverage*100:.0f}%")
+            if debug:
+                dp = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'phone_paper_debug.png')
+                cv2.imwrite(dp, paper_pixels)
+                print(f"      调试图: {dp}")
+            return {
+                'mode': 'with-obstruction',
+                'mask': paper_pixels,
+                'confidence': 'medium',
+                'stats': {'mean': mean, 'std': std},
+            }
 
-    if ph < h * 0.15 or pw < w * 0.15:
-        return None
-
-    # 缩进 2% 避免纸边
-    shrink = int(min(pw, ph) * 0.02)
-    x += shrink
-    y += shrink
-    pw -= 2 * shrink
-    ph -= 2 * shrink
-
-    if pw <= 0 or ph <= 0:
-        return None
-
-    # 矩形轮廓
-    contour = np.array([
-        [[x, y]], [[x + pw, y]], [[x + pw, y + ph]], [[x, y + ph]]
-    ], dtype=np.int32)
-
-    pct = pw * ph / (w * h) * 100
-    print(f"   ✅ 白纸: ({x},{y}) {pw}x{ph}, 占画面 {pct:.1f}%")
-
-    if debug:
-        dbg = frame.copy()
-        cv2.rectangle(dbg, (x, y), (x + pw, y + ph), (0, 255, 0), 3)
-        dp = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'paper_debug.png')
-        cv2.imwrite(dp, dbg)
-        print(f"      调试图: {dp}")
-
-    return {'x': x, 'y': y, 'w': pw, 'h': ph, 'contour': contour}
+    # Case 3: 画面异常（拍摄失败或 setup 不对）
+    cx, cy = w // 2, h // 2
+    dw, dh = int(w * 0.7), int(h * 0.7)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    mask[cy - dh // 2:cy + dh // 2, cx - dw // 2:cx + dw // 2] = 255
+    print(f"   ⚠️  画面异常: mean={mean:.0f}, std={std:.0f}")
+    print(f"      建议检查：是否对准纸？是否有大片阴影？")
+    print(f"      退回中心 70% 区域")
+    return {
+        'mode': 'center-fallback',
+        'mask': mask,
+        'confidence': 'low',
+        'stats': {'mean': mean, 'std': std},
+    }
 
 
 # ============================================================
-# Webcam 专用：墨迹检测（在白纸区域内）
+# Phone 专用：笔迹检测（简化自 webcam 版）
 # ============================================================
 
-# 不同书写介质的灰度阈值：
-#   brush  — 毛笔，墨色极深（灰度 < 50），threshold=80 可靠
-#   pencil — 铅笔，笔迹较浅（灰度 ~100-180），需要更高阈值
+# 介质阈值（与 webcam 保持一致）
 MEDIUM_THRESHOLDS = {'brush': 80, 'pencil': 170}
 
 
-def _parse_char_region(spec, frame_w, frame_h):
-    """解析 --char-region 字符串。
+def _parse_char_region(spec: str, frame_w: int, frame_h: int) -> dict:
+    """解析 --char-region 字符串（与 webcam 版一致）。
 
-    支持格式（数值可以是像素或 0-1 之间的小数）：
-      'cx,cy'          → 以(cx,cy)为中心，自动用画面 1/4 作为 w/h
-      'cx,cy,w,h'      → 完整矩形（中心点 + 尺寸）
-      'x:y:w:h'        → 左上角 + 尺寸（绝对像素）
+    支持格式：
+      'cx,cy'          → 中心 + 画面 1/4 自动尺寸
+      'cx,cy,w,h'      → 完整矩形（中心 + 尺寸）
+      'x:y:w:h'        → 左上角 + 尺寸
+    数值 <1 视为画面比例，≥1 视为像素。
     """
     s = spec.strip()
     sep = ':' if ':' in s else ','
     parts = [p.strip() for p in s.split(sep)]
     if len(parts) not in (2, 4):
-        raise ValueError(f"--char-region 需 2 或 4 个值 (cx,cy 或 cx,cy,w,h)，got: {spec}")
+        raise ValueError(f"--char-region 需 2 或 4 个值，got: {spec}")
 
     def _resolve(v, axis):
         v = float(v)
-        if 0 < v < 1:  # 小数视为画面比例
+        if 0 < v < 1:
             return int(v * (frame_w if axis == 'x' else frame_h))
         return int(v)
 
@@ -161,14 +221,14 @@ def _parse_char_region(spec, frame_w, frame_h):
         cy = _resolve(parts[1], 'y')
         bw, bh = frame_w // 4, frame_h // 4
     else:
-        if sep == ':':  # x:y:w:h 格式（左上角 + 尺寸）
+        if sep == ':':
             x = _resolve(parts[0], 'x')
             y = _resolve(parts[1], 'y')
             bw = _resolve(parts[2], 'x')
             bh = _resolve(parts[3], 'y')
             cx = x + bw // 2
             cy = y + bh // 2
-        else:  # cx,cy,w,h（中心 + 尺寸）
+        else:
             cx = _resolve(parts[0], 'x')
             cy = _resolve(parts[1], 'y')
             bw = _resolve(parts[2], 'x')
@@ -180,28 +240,18 @@ def _parse_char_region(spec, frame_w, frame_h):
     return {'x': x, 'y': y, 'w': bw, 'h': bh, 'cx': cx, 'cy': cy}
 
 
-def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_region=None):
+def detect_ink_phone(video_path, paper, debug=False, medium='auto', char_region=None):
     """
-    在白纸区域内检测笔迹（毛笔/铅笔）。
+    手机场景的笔迹检测（简化自 webcam 版）。
 
-    核心区别（vs 手机版）：
-    - 不需要旋转
-    - 用白纸轮廓遮罩（而非白纸像素遮罩）精确隔离纸面，排除桌面纹理干扰
-    - 更低的面积阈值（webcam 视角宽，字相对较小）
-
-    Args:
-        video_path: 视频路径
-        paper: detect_paper_region 的返回值（含 contour），None 时回退到区域估算
-        debug: 保存检测调试图
-        medium: 书写介质 'auto' | 'brush' | 'pencil'
-            - brush: 灰度阈值 80（默认，适合毛笔）
-            - pencil: 灰度阈值 170（适合铅笔）
-            - auto: 先按 brush 尝试，无笔迹则回退到 pencil
+    vs webcam 的 detect_ink_webcam:
+      - analysis_mask 直接用 paper['mask']（多数情况就是整图），不再需要精细 erode
+      - 面积阈值提高到 PHONE_MIN_INK_AREA（500 vs webcam 100）—— 字大、信号强
+      - 呼吸空间 PHONE_BREATHING（15% vs webcam 25%）—— 字已占画面较大份额
+      - skin_mask 仍然保留：手指/手背阴影虽不常出现但偶有
 
     Returns:
         (ink_dict, detected_medium)
-            ink_dict: {'x', 'y', 'w', 'h', 'cx', 'cy'} 笔迹区域（全帧坐标）
-            detected_medium: 'brush' | 'pencil'（auto 模式下实际使用的）
     """
     import cv2
     import numpy as np
@@ -210,38 +260,25 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # 用户手动指定字符区域 — 跳过自动检测（适合极淡铅笔/lined paper）
+    # 手动指定字符区域 — 跳过自动检测
     if char_region:
         ink = _parse_char_region(char_region, w, h)
-        print(f"   ✅ 手动指定区域: ({ink['x']},{ink['y']}) {ink['w']}x{ink['h']}, 中心: ({ink['cx']},{ink['cy']})")
-        # 手动模式仍按 medium 报告，brush 没指定时默认 pencil（手动模式通常用于淡笔迹）
+        print(f"   ✅ 手动指定区域: ({ink['x']},{ink['y']}) {ink['w']}x{ink['h']}")
         return ink, (medium if medium in ('brush', 'pencil') else 'pencil')
 
-    # 构建分析遮罩：只在白纸区域内检测笔迹
-    if paper and 'contour' in paper:
-        # 用白纸轮廓生成精确遮罩，收缩避免纸边。收缩量需 scale-with-resolution：
-        # 4K 视频纸边常有 30-50px 宽的阴影/木纹残留，固定 15px 不够。
-        # 取 max(15, min(h,w)//60)：1080p→18, 4K→36（每次 erode 有 2× 效应，iter=2 → 72px 总收缩）
-        erode_k = max(15, min(h, w) // 60)
-        analysis_mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.drawContours(analysis_mask, [paper['contour']], -1, 255, -1)
-        analysis_mask = cv2.erode(analysis_mask,
-                                  cv2.getStructuringElement(cv2.MORPH_RECT, (erode_k, erode_k)),
-                                  iterations=2)
-        a_left, a_top = paper['x'], paper['y']
-        a_right = paper['x'] + paper['w']
-        a_bot = paper['y'] + paper['h']
-    else:
-        # 回退：排除左侧 20%（书本）+ 上下 5%
-        analysis_mask = np.zeros(gray.shape, dtype=np.uint8)
-        a_left = int(w * 0.20)
-        a_right = int(w * 0.95)
-        a_top = int(h * 0.05)
-        a_bot = int(h * 0.95)
-        analysis_mask[a_top:a_bot, a_left:a_right] = 255
+    # analysis_mask：手机场景直接用 paper mask（多数是整图）
+    # 不做 erode（webcam 是为了避开纸边阴影；phone 没有纸边）
+    analysis_mask = paper['mask']
+    a_left, a_top = 0, 0
+    a_right, a_bot = w, h
+    # 对 with-obstruction / center-fallback 模式，用 mask 的外接矩形收紧搜索范围
+    if paper['mode'] != 'full-frame':
+        ys, xs = np.where(analysis_mask > 0)
+        if len(xs) > 0:
+            a_left, a_right = int(xs.min()), int(xs.max())
+            a_top, a_bot = int(ys.min()), int(ys.max())
 
-    # 预计算肤色遮罩：手指阴影/指甲轮廓会被当作笔迹，用 YCrCb 色度剔除
-    # （色度独立于灰度阈值，对 brush/pencil 都适用）
+    # 肤色遮罩（手指阴影排除）
     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
     skin_mask = cv2.inRange(ycrcb,
                             np.array([0, 133, 77], dtype=np.uint8),
@@ -251,12 +288,10 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
                            iterations=2)
     not_skin = cv2.bitwise_not(skin_mask)
 
-    # 平场校正：在分析之前把纸面光照渐变抹平，让 brush/pencil 都在
-    # 统一的干净基底上跑阈值。flat_gray 中纸面 ≈ 255。
+    # 平场校正（在强信号场景 redundant 但一致性更好）
     try:
         flat_gray = ie.flat_field_correct(gray)
-        if float(np.median(flat_gray[analysis_mask > 0])) < 150:
-            # 异常：纸面中位数应接近 255，远离说明校正失败（极端光照）
+        if float(np.median(flat_gray[analysis_mask > 0])) < 130:
             print("   ⚠️  平场校正结果异常，回退原始灰度")
             flat_gray = gray
     except Exception as _e:
@@ -264,7 +299,6 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
         flat_gray = gray
 
     def _brush_pass():
-        # 全局阈值：毛笔墨色极深 (<50)，在 flat_gray 上 threshold=80 仍然安全
         _, im = cv2.threshold(flat_gray, MEDIUM_THRESHOLDS['brush'], 255, cv2.THRESH_BINARY_INV)
         im = cv2.bitwise_and(im, analysis_mask)
         im = cv2.bitwise_and(im, not_skin)
@@ -273,14 +307,9 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
         return cs, im
 
     def _brush_success(cs):
-        """毛笔检测成功的真墨色校验。
-        单纯靠「大面积轮廓」会被手指阴影/桌面投影诱骗——它们能凑出上千像素，
-        但灰度中位数落在 70-90 的阴影区。真正的毛笔墨迹中位数 < 60。
-        同时要求 area > 1000（不再是 100），避免小噪点触发。
-        在 flat_gray 上校验——确保是真墨色而非残留的光照效应。
-        """
+        """毛笔真墨色校验——阴影不应通过（中位数 <60）。"""
         for c in cs:
-            if cv2.contourArea(c) <= 1000:
+            if cv2.contourArea(c) <= PHONE_MIN_INK_AREA * 2:
                 continue
             mask = np.zeros(flat_gray.shape, dtype=np.uint8)
             cv2.drawContours(mask, [c], -1, 255, -1)
@@ -290,51 +319,31 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
         return False
 
     def _pencil_pass():
-        # Pencil 管线：平场校正 → (bg_subtract ∪ 简单阈值) → 去线 → 聚类
-        # 为什么两种方法并联：
-        #   - bg_subtract 对 ruled-paper 场景鲁棒（局部对比），但纸面几乎纯白
-        #     (~255) 时，局部膨胀 clean_paper 估计会被铅笔本身拉暗，diff 变小、
-        #     Otsu 漏掉大部分字。she.mp4 (白纸) 实测：字真实暗像素 879，
-        #     bg_subtract 只抓到 67。
-        #   - 简单阈值 `flat_gray < 200` 直接抓任何比纸面明显暗的像素，
-        #     在白纸上可靠；但在有印刷底纹/阴影的 paper 上会误抓。
-        #   - 两者 OR 取并集：白纸取简单阈值的覆盖，ruled paper 取 bg_subtract 的精度。
+        # 与 webcam 同样的并联策略：bg_subtract ∪ 简单阈值
         im_bg = ie.background_subtract_mask(flat_gray, blur_ksize=5, min_threshold=8)
         _, im_thresh = cv2.threshold(flat_gray, 200, 255, cv2.THRESH_BINARY_INV)
         im = cv2.bitwise_or(im_bg, im_thresh)
         im = cv2.bitwise_and(im, analysis_mask)
         im = cv2.bitwise_and(im, not_skin)
-        # 先检测再减线：白纸图上零成本（两层去线设计）
         im = ie.remove_ruled_lines(im, paper_mask=analysis_mask,
                                    h_lines='auto', v_lines='auto')
-        # ⚠️ 这里原本有 3x3 MORPH_OPEN 去散点——但铅笔笔锋/飞白往往就是 1-2px 宽，
-        # 3x3 open 会把它们抹掉，导致字符失踪。改用只消除「孤立单像素」的连通域过滤。
-        # 对 4K 视频，保留 ≥2 像素的连通分量即可去掉 CMOS 噪声的孤点，不伤铅笔线。
+        # 单像素噪点过滤
         n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(im, connectivity=8)
         if n_lbl > 1:
-            # 面积 <2 的分量 = 孤立像素，移除（label 0 是背景，保持为 0）
             keep = np.zeros(n_lbl, dtype=bool)
             keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 2
             im = np.where(keep[labels], 255, 0).astype(np.uint8)
-        # 关键：定位字符密集区。铅笔字像素分散，需要先用大核 close 把字
-        # 笔画团成一坨，再选「形状最像方块 + 内部笔迹最多」的最大 blob，
-        # 最后只保留落在其附近的原始笔画。
-        # 降低 cluster_kernel：4K 视频字符 ~200x200，笔画间距 <50px，
-        # 用 20-25px 的 kernel（iter=2 即 ~80-100px merge 范围）足够连接
-        # 字内笔画，又不会把邻近的 ruled-line 残留碎片拉进来。
-        cluster_kernel = max(20, min(h, w) // 100)
+        # 密集区聚类——phone 场景字大，cluster_kernel 可以略大
+        cluster_kernel = max(25, min(h, w) // 80)
         merged = cv2.dilate(im, cv2.getStructuringElement(
             cv2.MORPH_RECT, (cluster_kernel, cluster_kernel)), iterations=2)
         big_cs, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if big_cs:
-            # 评分：用 bbox 内的**原始 mask 像素数**，而非 cluster 面积。
-            # cluster 面积被 144px 的 dilate 吹大，稀疏噪点也能凑出近方形
-            # 大块；真实字符的 mask 密度应该明显高于杂散残留。
             def _block_score(c):
                 bx0, by0, cw_, ch_ = cv2.boundingRect(c)
                 aspect = max(cw_, ch_) / max(1, min(cw_, ch_))
                 mask_in = int((im[by0:by0 + ch_, bx0:bx0 + cw_] > 0).sum())
-                return mask_in / max(1, aspect ** 1.5)  # aspect^1.5 折衷
+                return mask_in / max(1, aspect ** 1.5)
             best = max(big_cs, key=_block_score)
             bx, by, bw_, bh_ = cv2.boundingRect(best)
             pad = max(60, max(bw_, bh_) // 4)
@@ -342,26 +351,19 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
             focus[max(0, by - pad):by + bh_ + pad,
                   max(0, bx - pad):bx + bw_ + pad] = 255
             im = cv2.bitwise_and(im, focus)
-            # 铅笔字笔画破碎，直接返回 cluster bbox 作为单一合成轮廓——
-            # 让下游的 edge-artifact / spatial-cluster 阶段拿到正确的字符区域，
-            # 而不是一堆 20-50px 的小片段被错误地重新聚类到字的一角。
             synth = np.array([
                 [[bx, by]], [[bx + bw_, by]],
                 [[bx + bw_, by + bh_]], [[bx, by + bh_]]
             ], dtype=np.int32)
             return [synth], im
-        # 没有 big_cs 时退回原始连通分量
         cs, _ = cv2.findContours(im, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return cs, im
 
-    # 按 medium 策略选择检测器
-    # auto 模式用直方图预分类（一次判断、零分支竞争），替代旧的 attempt-fallback 循环。
-    # 旧逻辑：brush 先跑，若 area>100 的任何轮廓都算成功 → 阴影诱骗
-    # 新逻辑：先看纸面最暗 1% 像素的中位数，直接决定走哪条路
+    # 介质分类
     if medium == 'auto':
         cls = ie.classify_medium(flat_gray, paper_mask=analysis_mask)
         if cls == 'empty':
-            print("   ⚠️  画面近乎空白（纸面最暗区仍 ≥200），无法检测笔迹")
+            print("   ⚠️  画面近乎空白，无法检测笔迹")
             cx = (a_left + a_right) // 2
             cy = (a_top + a_bot) // 2
             return ({'x': cx - w // 8, 'y': cy - h // 8, 'w': w // 4, 'h': h // 4,
@@ -373,37 +375,32 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
 
     if detected_medium == 'brush':
         contours, ink_mask = _brush_pass()
-        # brush 需要真墨色校验（防阴影诱骗）
         if not _brush_success(contours):
-            # 验证失败：可能用户指定 brush 但实际是 pencil，尝试 pencil
             if medium == 'brush':
                 print("   ⚠️  指定 brush 但未检出真墨色，仍按 brush 处理")
-            else:  # classify_medium 给了 brush 但校验没过，极少见
+            else:
                 print("   ℹ️  brush 未通过真墨色校验，回退 pencil")
                 contours, ink_mask = _pencil_pass()
                 detected_medium = 'pencil'
-    else:  # pencil
+    else:
         contours, ink_mask = _pencil_pass()
 
     if not contours:
-        print("   ⚠️  未检测到笔迹，使用白纸中心")
+        print("   ⚠️  未检测到笔迹，使用纸面中心")
         cx = (a_left + a_right) // 2
         cy = (a_top + a_bot) // 2
-        return {'x': cx - w // 8, 'y': cy - h // 8, 'w': w // 4, 'h': h // 4, 'cx': cx, 'cy': cy}, detected_medium
+        return ({'x': cx - w // 8, 'y': cy - h // 8, 'w': w // 4, 'h': h // 4,
+                 'cx': cx, 'cy': cy}, detected_medium)
 
-    # 面积过滤：最小 100px 适合毛笔，但铅笔笔画 3-5px 宽、破碎成 30-80px 的小段，
-    # 100 门槛会把它们全部筛掉。pencil 用 20 作为底线（噪点已在 _pencil_pass 的
-    # CC-size filter 里被消除，幸存下来的都是有结构的笔画片段）。
-    mn = 20 if detected_medium == 'pencil' else 100
-    mx = cv2.countNonZero(analysis_mask) * 0.15
+    # 面积过滤（phone 版下限 500——字大、信号强）
+    mn = max(20, PHONE_MIN_INK_AREA // 5) if detected_medium == 'pencil' else PHONE_MIN_INK_AREA
+    mx = cv2.countNonZero(analysis_mask) * 0.30  # phone 字可占画面 15-25%，上限 30%
 
-    # 纸张边缘伪影过滤：贴近纸边 + 长宽比极端的轮廓通常是纸张边缘
-    # 阴影/折痕，不是字。比如 hui.mp4 的左纸边一条 42x163 的暗条
-    # （aspect 3.88）面积比真正的字笔画还大，会被误选为聚类锚点。
-    edge_margin = 30  # 距纸边 30px 内算"贴边"
-    aspect_max = 2.5  # 长宽比超过此阈值 + 贴边 → 视为伪影
+    # 纸面边缘伪影过滤（phone 场景通常无纸边，这段几乎不生效，保留防御）
+    edge_margin = 30
+    aspect_max = 2.5
 
-    def _is_paper_edge_artifact(c):
+    def _is_edge_artifact(c):
         cx_, cy_, cw_, ch_ = cv2.boundingRect(c)
         touches_edge = (
             cx_ - a_left < edge_margin
@@ -416,12 +413,11 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
 
     valid = [c for c in contours
              if mn < cv2.contourArea(c) < mx
-             and not _is_paper_edge_artifact(c)]
+             and not _is_edge_artifact(c)]
     if not valid:
-        # 全部被过滤时退回最大轮廓
         valid = [max(contours, key=cv2.contourArea)]
 
-    # 空间聚类：以最大轮廓为锚点，只保留距离在 3 倍半径内的轮廓
+    # 空间聚类（以最大轮廓为锚点）
     anchor = max(valid, key=cv2.contourArea)
     ax, ay, aw, ah = cv2.boundingRect(anchor)
     acx, acy = ax + aw // 2, ay + ah // 2
@@ -435,8 +431,8 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
     pts = np.vstack(valid)
     x, y, bw, bh = cv2.boundingRect(pts)
 
-    # 呼吸空间 25%（webcam 字小，多留一些）
-    px, py = int(bw * 0.25), int(bh * 0.25)
+    # 呼吸空间 15%（phone 专用，vs webcam 25%）
+    px, py = int(bw * PHONE_BREATHING), int(bh * PHONE_BREATHING)
     x = max(0, x - px)
     y = max(0, y - py)
     bw = min(w - x, bw + 2 * px)
@@ -453,9 +449,7 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
         dbg = frame.copy()
         cv2.rectangle(dbg, (x, y), (x + bw, y + bh), (0, 255, 0), 3)
         cv2.circle(dbg, (cx, cy), 10, (0, 0, 255), -1)
-        if paper and 'contour' in paper:
-            cv2.drawContours(dbg, [paper['contour']], -1, (255, 0, 0), 2)
-        dp = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ink_webcam_debug.png')
+        dp = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ink_phone_debug.png')
         cv2.imwrite(dp, dbg)
         print(f"      调试图: {dp}")
 
@@ -463,26 +457,18 @@ def detect_ink_webcam(video_path, paper=None, debug=False, medium='auto', char_r
 
 
 # ============================================================
-# Webcam 专用：找干净的最后一帧
+# Phone 专用：找干净的最后一帧（逻辑复制自 webcam 版）
 # ============================================================
 
-def find_clean_last_frame_webcam(video_path):
+def find_clean_last_frame_phone(video_path):
     """
-    从视频末尾向前搜索「无手 + 亮度足够」的候选帧，取 5~10 帧的
-    逐像素中位数合成作为最终干净帧。
+    多帧中位数合成干净视频尾帧。逻辑与 webcam 版完全一致，
+    仅名字区分避免混淆。
 
-    为什么要多帧中位数：
-      铅笔信噪比远低于毛笔（笔迹相对纸面只有 30-60 灰度差），单帧
-      CMOS 底噪会干扰后续阈值检测。多帧中位数对偶发动作（手影一闪、
-      画面抖动、风扇气流）天然鲁棒，SNR 改善约 √n，是铅笔稳定检测
-      的关键前置步骤。
-
-    两层亮度兜底：
-      - 已处理过的视频末尾有 fade-out（全黑帧），必须跳过
-      - dao_v2.mp4 这类纸面本身偏暗的源，max≈190 也要能找到合格帧
-      所以用「搜索范围内最大亮度的 85%」作自适应地板。
-
-    候选帧偏好：肤色比例最低（手最干净）优先进入合成池。
+    为什么沿用：
+      - 多帧合成对偶发抖动/手影一闪天然鲁棒
+      - 相对排序（skin% 升序取前 8），不用绝对阈值
+      - 手机场景手可能常在画面，但合成仍能把静态字符保留
     """
     import cv2
     import numpy as np
@@ -490,9 +476,8 @@ def find_clean_last_frame_webcam(video_path):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     SEARCH_FRAMES = 90
-    TARGET_POOL = 8  # 合成目标帧数（5-10 之间折衷）
+    TARGET_POOL = 8
 
-    # Pass 1: 收集每帧的亮度（轻量，仅 grayscale 均值）
     brightness_by_offset = {}
     for offset in range(1, min(SEARCH_FRAMES + 1, total)):
         cap.set(cv2.CAP_PROP_POS_FRAMES, total - offset)
@@ -507,15 +492,10 @@ def find_clean_last_frame_webcam(video_path):
         return extract_frame(video_path, 'last')
 
     max_bright = max(brightness_by_offset.values())
-    brightness_floor = max_bright * 0.85  # 自适应阈值
+    brightness_floor = max_bright * 0.85
     qualifying = [o for o, b in brightness_by_offset.items() if b >= brightness_floor]
 
-    # Pass 2: 收集所有亮度合格帧的肤色比例（**去掉绝对阈值**，改用相对排序）
-    # 旧逻辑：要求 skin<2%，但 she.mp4 这类全程手在画面的视频全部不合格、
-    # 合成池永远为空、退回单帧 fallback——多帧中位数根本没机会跑。
-    # 新逻辑：取 skin% 最低的 k 帧（无论绝对值），手在不同位置的部分
-    # 会被中位数平均淡化，静态的字符保留。
-    candidates: list[tuple[float, int, np.ndarray]] = []  # (skin, offset, frame)
+    candidates: list = []
     for offset in sorted(qualifying):
         cap.set(cv2.CAP_PROP_POS_FRAMES, total - offset)
         ret, frame = cap.read()
@@ -531,19 +511,17 @@ def find_clean_last_frame_webcam(video_path):
     cap.release()
 
     if not candidates:
-        print("      ⚠️  未找到亮度合格帧（可能全部淡出），回退到最后一帧")
+        print("      ⚠️  未找到亮度合格帧，回退最后一帧")
         return extract_frame(video_path, 'last')
 
-    # 按肤色比例升序，取最干净的 N 帧（相对排序，不用绝对阈值）
     candidates.sort(key=lambda t: t[0])
     pool = candidates[:TARGET_POOL]
 
     if len(pool) < 3:
         skin, offset, frame = pool[0]
-        print(f"      ⚠️  亮度合格帧仅 {len(pool)} 张，回退单帧模式（倒数第 {offset} 帧, 肤色 {skin*100:.2f}%）")
+        print(f"      ⚠️  亮度合格帧仅 {len(pool)} 张，回退单帧 (倒数 {offset}, 肤色 {skin*100:.2f}%)")
         return frame
 
-    # 多帧中位数合成
     stack = np.stack([f for _, _, f in pool], axis=0)
     composite = np.median(stack, axis=0).astype(np.uint8)
     offsets = [o for _, o, _ in pool]
@@ -554,44 +532,20 @@ def find_clean_last_frame_webcam(video_path):
 
 
 # ============================================================
-# Webcam 专用：全视频搜索最佳封面源帧
+# Phone 专用：全视频搜索最佳封面源帧（逻辑复制自 webcam 版）
 # ============================================================
 
-def find_best_cover_frame(video_path, paper=None, ink_bbox=None, sample_fps=1.5):
+def find_best_cover_frame_phone(video_path, paper=None, ink_bbox=None, sample_fps=1.5):
     """
-    全视频搜索「字最完整 + 字上方的手遮挡最少」的 k 帧，逐像素中位数合成。
+    全视频扫描「字最完整 + 手最不挡字」的 k 帧，合成封面源。
 
-    与 find_clean_last_frame_webcam 的区别：
-      - 后者只看末尾 90 帧，用于视频 bbox（观众看过程，单帧脏一点没事）
-      - 本函数扫全视频，用于封面 thumb（静态图要求高）
-
-    观察：书写者完成一个字后常有「短暂抬手检查」的瞬间，可能在末尾也可能在中段。
-    仅末尾搜索完全错过这种黄金帧。
-
-    关键指标（经过 she.mp4 实测修正）：
-      - 不能用「纸面内 ink_area 最大」——书写中的手+臂在 bg_subtract 产生
-        大量 shadow-induced 假 ink 信号（skin mask 遮掉的只是手本身，
-        臂/袖的阴影扩展到周围），ink_area 反而随手的存在而增加。
-      - 改用「字符 bbox 内的肤色占比最低」——直接对应「手最不挡字」，
-        再要求字符 bbox 内 flat_gray 有足够暗像素（证明字真的写在那里）。
-
-    算法：
-      1. 按 sample_fps + 末尾 30 帧密采样混合
-      2. 对每个采样帧：
-         a) skin_over_char: ink_bbox 内肤色覆盖（手遮挡字的代理）
-         b) char_ink: ink_bbox 内 flat_gray 的暗像素数（字的可见度）
-      3. 筛选 char_ink ≥ max(char_ink) × 0.3 的帧（字基本可见）
-      4. 按 skin_over_char 升序取前 5-8 帧
-      5. BGR 重读这些帧，逐像素 np.median 合成
-      6. <3 帧 → 返回 None
+    逻辑与 webcam 版 find_best_cover_frame 一致。手机场景的 skin% 数值
+    通常比 webcam 更高（手机离手近），但因为用相对排序不受影响。
 
     Args:
-        video_path: 视频文件路径
-        paper: detect_paper_region 返回（选传）
-        ink_bbox: {'x','y','w','h'}，字符在帧上的大致位置（用于定位「手挡字」区域）
-
-    Returns:
-        composite_bgr (np.ndarray) 或 None（候选不足）
+        video_path: 视频路径
+        paper: detect_paper_phone 的返回值（可选，用于限定 mask）
+        ink_bbox: {'x','y','w','h'} 字符位置，用于定位「手挡字」指标
     """
     import cv2
     import numpy as np
@@ -601,63 +555,43 @@ def find_best_cover_frame(video_path, paper=None, ink_bbox=None, sample_fps=1.5)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration = total / max(fps, 1e-6)
     step = max(1, int(fps / sample_fps))
-    # 粗采样整视频 + 密采样末尾 30 帧。末尾密采样很关键：
-    # 书写者完成后常有 <1s 的抬手瞬间，粗采样步长 (fps/1.5 ≈ 6-20 帧)
-    # 有很大概率直接跳过这个黄金窗口。
     coarse = list(range(0, total, step))
     tail_start = max(0, total - 30)
     dense_tail = list(range(tail_start, total))
     sample_indices = sorted(set(coarse) | set(dense_tail))
-    print(f"      全视频采样: {len(sample_indices)} 帧 ("
-          f"粗采样 {len(coarse)} + 末尾密采样 {len(dense_tail)}; "
+    print(f"      全视频采样: {len(sample_indices)} 帧 "
+          f"(粗采样 {len(coarse)} + 末尾密采样 {len(dense_tail)}; "
           f"总 {total} 帧, {duration:.1f}s @ {sample_fps} fps)")
 
-    # 纸面 mask（用于把计量框限定在纸内）
-    if paper and 'contour' in paper:
-        # 需要从任意一帧拿到 frame shape
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        ret0, f0 = cap.read()
-        if not ret0:
-            cap.release()
-            return None
-        h0, w0 = f0.shape[:2]
-        paper_mask = np.zeros((h0, w0), dtype=np.uint8)
-        cv2.drawContours(paper_mask, [paper['contour']], -1, 255, -1)
-        paper_mask = cv2.erode(paper_mask,
-                               cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)),
-                               iterations=1)
-    else:
-        paper_mask = None
-        h0 = w0 = None
+    paper_mask = None
+    if paper and paper.get('mode') != 'full-frame':
+        # 只有 with-obstruction / center-fallback 模式才真正限定 mask
+        paper_mask = paper.get('mask')
 
     skin_lo = np.array([0, 133, 77], dtype=np.uint8)
     skin_hi = np.array([255, 173, 127], dtype=np.uint8)
 
-    # 解析 ink_bbox（字符区域），在其上做 skin occlusion 测量
     if ink_bbox:
         cbx, cby = int(ink_bbox['x']), int(ink_bbox['y'])
         cbw, cbh = int(ink_bbox['w']), int(ink_bbox['h'])
     else:
-        # 无 bbox 时用画面中心 1/3 作兜底
-        cbx = (w0 or 1920) // 3; cby = (h0 or 1080) // 3
-        cbw = (w0 or 1920) // 3; cbh = (h0 or 1080) // 3
+        cbx = cby = cbw = cbh = None
 
-    stats: list[tuple[int, float, int]] = []  # (idx, skin_over_char, char_ink)
+    stats: list = []
     for idx in sample_indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if not ret:
             continue
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if paper_mask is None:
-            h_, w_ = gray.shape
-            paper_mask = np.ones((h_, w_), dtype=np.uint8) * 255
+        h_, w_ = gray.shape
+        if cbx is None:
+            cbx = w_ // 3; cby = h_ // 3
+            cbw = w_ // 3; cbh = h_ // 3
         ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
         skin = cv2.inRange(ycrcb, skin_lo, skin_hi)
-        # Skin 占字符 bbox 的比例：手挡字的直接代理
         char_skin = skin[cby:cby + cbh, cbx:cbx + cbw]
         skin_over_char = float((char_skin > 0).mean()) if char_skin.size else 1.0
-        # 字符 bbox 内 flat_gray 的可见暗像素（保证字真的在那里）
         flat = ie.flat_field_correct(gray)
         char_flat = flat[cby:cby + cbh, cbx:cbx + cbw]
         char_ink = int((char_flat < 200).sum()) if char_flat.size else 0
@@ -667,12 +601,7 @@ def find_best_cover_frame(video_path, paper=None, ink_bbox=None, sample_fps=1.5)
         cap.release()
         return None
 
-    # 核心洞察（she.mp4 实测）：书写中的手/臂阴影在字符 bbox 内产生 10-20k 的
-    # 假 dark 信号；手移开后字真正的暗像素只有 1-3k。若用「char_ink 最大」筛选，
-    # 永远选到"手最近"的帧。
-    # 正确策略：先按 skin_over_char 升序选"手最不遮字"的前 N 帧，
-    # 再过滤掉 char_ink < 500 的空白帧（书写开始前的帧）。
-    MIN_CHAR_INK = 500  # 500 px dark 足以说明字开始写了
+    MIN_CHAR_INK = 500
     meaningful = [s for s in stats if s[2] >= MIN_CHAR_INK]
     if not meaningful:
         cap.release()
@@ -680,7 +609,7 @@ def find_best_cover_frame(video_path, paper=None, ink_bbox=None, sample_fps=1.5)
         print(f"      ⚠️  全视频字符 bbox 内暗像素 max={ink_max} <500，字未写")
         return None
 
-    meaningful.sort(key=lambda s: s[1])  # skin_over_char 升序
+    meaningful.sort(key=lambda s: s[1])
     pool_stats = meaningful[:8]
     print(f"      有字候选 {len(meaningful)} 帧 (char_ink≥{MIN_CHAR_INK}), "
           f"取 skin_over_char 最低前 {len(pool_stats)}")
@@ -689,7 +618,6 @@ def find_best_cover_frame(video_path, paper=None, ink_bbox=None, sample_fps=1.5)
         print(f"      ⚠️  可用候选仅 {len(pool_stats)} 帧，不足以合成")
         return None
 
-    # 全彩重读 pool 帧
     frames = []
     for idx, _, _ in pool_stats:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -716,91 +644,90 @@ def find_best_cover_frame(video_path, paper=None, ink_bbox=None, sample_fps=1.5)
 # 主处理流程
 # ============================================================
 
-def process_webcam_video(input_path, output_path, voiceover_path=None,
-                         target_fill_ratio=DEFAULT_FILL_RATIO,
-                         hold_seconds=DEFAULT_HOLD_SECONDS,
-                         output_width=DEFAULT_OUTPUT_WIDTH,
-                         output_height=DEFAULT_OUTPUT_HEIGHT,
-                         enable_color_correct=True,
-                         fade_in=DEFAULT_FADE_IN,
-                         fade_out=DEFAULT_FADE_OUT,
-                         subtitle_text=None,
-                         tts_text=None,
-                         tts_voice=DEFAULT_TTS_VOICE,
-                         font_path=None,
-                         generate_thumb=True,
-                         debug=False,
-                         medium='auto',
-                         char_region=None):
-    """Webcam 版主处理流程。"""
+def process_phone_video(input_path, output_path, voiceover_path=None,
+                        target_fill_ratio=PHONE_FILL_RATIO,
+                        hold_seconds=DEFAULT_HOLD_SECONDS,
+                        output_width=DEFAULT_OUTPUT_WIDTH,
+                        output_height=DEFAULT_OUTPUT_HEIGHT,
+                        enable_color_correct=True,
+                        fade_in=DEFAULT_FADE_IN,
+                        fade_out=DEFAULT_FADE_OUT,
+                        subtitle_text=None,
+                        tts_text=None,
+                        tts_voice=DEFAULT_TTS_VOICE,
+                        font_path=None,
+                        generate_thumb=True,
+                        debug=False,
+                        medium='auto',
+                        char_region=None,
+                        rotate='none'):
+    """Phone 版主处理流程。结构沿用 webcam，仅替换 paper/ink 检测 + 加 rotate 步骤。"""
 
     print("=" * 60)
-    print(f"极客禅·墨 Webcam 处理器 v{VERSION}")
+    print(f"极客禅·墨 Phone 处理器 v{VERSION}")
     print("=" * 60)
 
     tmpdir = tempfile.mkdtemp()
-    clean_frame_raw = None
     clean_frame_processed = None
 
     try:
+        # Step 0: rotate 预处理（phone 专有）
+        if rotate != 'none':
+            print(f"\n🔄 Step 0: 视频 rotate ({rotate})...")
+        working_path = rotate_video_if_needed(input_path, rotate, tmpdir)
+
         # Step 1: 视频信息
         print("\n📹 Step 1: 分析视频...")
-        vi = get_video_info(input_path)
+        vi = get_video_info(working_path)
         print(f"   尺寸: {vi['width']}x{vi['height']}, 时长: {vi['duration']:.1f}s, 帧率: {vi['fps']:.0f}fps")
 
-        # Step 2: 检测白纸区域
-        print("\n📄 Step 2: 检测白纸...")
-        paper = detect_paper_region(input_path, debug=debug)
+        # Step 2: 纸面 sanity check（phone 专有）
+        print("\n📄 Step 2: 纸面检测 (sanity check)...")
+        paper = detect_paper_phone(working_path, debug=debug)
 
-        # Step 2.5: 采样纸面亮度 → 色彩校正归一化（v4：根治下游「假设白纸」级联失败）
-        import cv2
-        import numpy as np
-        if paper and 'contour' in paper:
-            _probe = extract_frame(input_path, 'last')
-            _ph, _pw = _probe.shape[:2]
-            _paper_mask = np.zeros((_ph, _pw), dtype=np.uint8)
-            cv2.drawContours(_paper_mask, [paper['contour']], -1, 255, -1)
-            paper_p95 = sample_paper_brightness(input_path, _paper_mask, 'last')
-        else:
-            paper_p95 = sample_paper_brightness(input_path, None, 'last')
+        # Step 2.5: 采样纸面亮度 → 色彩校正归一化（v4：根治灰纸 thumb/cover 级联失败）
+        paper_p95 = sample_paper_brightness(working_path, paper['mask'], 'last')
         _gain_est = min(max(240.0 / max(paper_p95, 1.0), 0.8), 2.5)
         print(f"   📊 纸面归一化: p95={paper_p95:.0f} → 240 (gain≈{_gain_est:.2f})")
 
-        # Step 3: 笔迹检测（支持毛笔/铅笔/手动指定区域）
+        # Step 3: 笔迹检测
         if char_region:
             print(f"\n🔍 Step 3: 用户指定字符区域 ({char_region})...")
         else:
             print(f"\n🔍 Step 3: 检测笔迹 (medium={medium})...")
-        ink, detected_medium = detect_ink_webcam(input_path, paper, debug=debug,
-                                                 medium=medium, char_region=char_region)
+        ink, detected_medium = detect_ink_phone(working_path, paper, debug=debug,
+                                                medium=medium, char_region=char_region)
 
         # Step 4: 计算裁剪参数
-        # 约束裁剪框在白纸区域内
-        if paper:
-            crop_x_min = paper['x']
-            crop_x_max = paper['x'] + paper['w']
-            crop_y_min = paper['y']
-            crop_y_max = paper['y'] + paper['h']
+        # Phone 场景：paper mask 通常是整图，crop 可以自由定位；
+        # 仅当 obstruction/fallback 模式时才用 mask 外接矩形收紧
+        if paper['mode'] == 'full-frame':
+            crop_x_min, crop_x_max = 0, vi['width']
+            crop_y_min, crop_y_max = 0, vi['height']
         else:
-            crop_x_min = int(vi['width'] * 0.15)
-            crop_x_max = vi['width']
-            crop_y_min = 0
-            crop_y_max = vi['height']
+            import numpy as np
+            ys, xs = np.where(paper['mask'] > 0)
+            if len(xs) > 0:
+                crop_x_min = int(xs.min())
+                crop_x_max = int(xs.max())
+                crop_y_min = int(ys.min())
+                crop_y_max = int(ys.max())
+            else:
+                crop_x_min, crop_x_max = 0, vi['width']
+                crop_y_min, crop_y_max = 0, vi['height']
 
         crop = calculate_crop(
             ink, vi['width'], vi['height'],
             target_fill_ratio, output_width, output_height,
             y_min=crop_y_min, y_max=crop_y_max,
         )
-        # 约束 x 方向不超出白纸（位置 + 宽度都钳位）
         if crop['x'] < crop_x_min:
             crop['x'] = crop_x_min
         if crop['x'] + crop['w'] > crop_x_max:
             crop['x'] = max(crop_x_min, crop_x_max - crop['w'])
-        # 裁剪宽度不超过纸面宽度（保持 9:16 宽高比避免缩放失真）
         available_w = crop_x_max - crop['x']
         if crop['w'] > available_w:
-            crop['w'] = available_w - (available_w % 2)  # ffmpeg 偶数
+            crop['w'] = available_w - (available_w % 2)
             target_aspect = output_width / output_height
             crop['h'] = int(crop['w'] / target_aspect)
             crop['h'] -= crop['h'] % 2
@@ -808,42 +735,30 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
             crop['scale_factor'] = output_width / crop['w']
 
         sf = crop['scale_factor']
-
         print(f"\n✂️  Step 4: 裁剪参数")
         print(f"   区域: ({crop['x']},{crop['y']}) {crop['w']}x{crop['h']}")
         print(f"   放大: {sf:.2f}x, 目标字占比: ~{target_fill_ratio * 100:.0f}%")
 
-        # Step 5-7: 构建滤镜链
+        # Step 5-7: 视频处理
         print(f"\n🎬 Step 5-7: 视频处理...")
-        vf_parts = []
-
-        # 裁剪
-        vf_parts.append(f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}")
-        print(f"   ✓ 裁剪居中")
-
-        # 缩放
-        vf_parts.append(f"scale={output_width}:{output_height}:flags=lanczos")
-        print(f"   ✓ 缩放 {output_width}x{output_height}")
-
-        # 白平衡
+        vf_parts = [
+            f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
+            f"scale={output_width}:{output_height}:flags=lanczos",
+        ]
+        print(f"   ✓ 裁剪+缩放 {output_width}x{output_height}")
         if enable_color_correct:
             vf_parts.append(build_color_correction_filter(paper_p95))
             print("   ✓ 白平衡校正")
-
-        # 锐化
         sharp = build_sharpen_filter(sf)
         vf_parts.append(sharp)
         print(f"   ✓ 锐化 ({sharp.split('=')[0]})")
-
-        # 淡入
         if fade_in > 0:
             vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
             print(f"   ✓ 淡入 {fade_in}s")
 
-        # 一次性处理
         cropped_video = os.path.join(tmpdir, 'processed.mp4')
         run_ffmpeg([
-            'ffmpeg', '-y', '-i', input_path,
+            'ffmpeg', '-y', '-i', working_path,
             '-vf', ','.join(vf_parts),
             '-an',
             '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
@@ -858,17 +773,15 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
         if hold_seconds > 0:
             print(f"\n⏸️  Step 8: 静止画面 ({hold_seconds}s)...")
             print("   检测无手帧...")
-
             import cv2
-            clean_frame = find_clean_last_frame_webcam(input_path)
-
+            clean_frame = find_clean_last_frame_phone(working_path)
             clean_frame_raw = os.path.join(tmpdir, 'clean_raw.png')
             cv2.imwrite(clean_frame_raw, clean_frame)
 
-            # 对帧应用相同的裁剪+缩放+色彩校正
-            vf_still = []
-            vf_still.append(f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}")
-            vf_still.append(f"scale={output_width}:{output_height}:flags=lanczos")
+            vf_still = [
+                f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
+                f"scale={output_width}:{output_height}:flags=lanczos",
+            ]
             if enable_color_correct:
                 vf_still.append(build_color_correction_filter(paper_p95))
             vf_still.append(build_sharpen_filter(sf))
@@ -890,16 +803,9 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
 
         # Step 9: TTS
         tts_srt_path = None
-
         if tts_text and not voiceover_path:
             print(f"\n🗣️  Step 9: TTS 语音合成...")
             cur_dur = get_video_info(current_video)['duration']
-            # 旁白与视频「同时」播放（混音于 t=0），不是接在视频后。
-            # 所以预算应为视频长度本身，让旁白以自然语速覆盖书写过程；
-            # 上限 SHORTS_MAX_DURATION-1 防止旁白延长后超 60s。
-            # （此前误用 SHORTS_MAX_DURATION-cur_dur，把旁白挤进剩余时间，
-            #  例如 hui.mp4 视频 45s → 预算 15s → 121 字被压成 14.9s 极速念完，
-            #  字才写到 1/3 旁白就结束了。）
             tts_budget = min(cur_dur, SHORTS_MAX_DURATION - 1)
             print(f"   视频: {cur_dur:.0f}s, 旁白预算: {tts_budget:.0f}s")
             tts_audio_path, tts_srt_path = generate_tts(
@@ -910,14 +816,11 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
         # Step 10: 合并旁白
         if voiceover_path and os.path.exists(voiceover_path):
             print(f"\n🎙️  Step 10: 合并旁白...")
-
             normalized_audio = os.path.join(tmpdir, 'normalized.m4a')
             normalize_audio(voiceover_path, normalized_audio)
-
             vid_dur = get_video_info(current_video)['duration']
             vo_dur = get_audio_duration(normalized_audio)
             print(f"   视频: {vid_dur:.1f}s, 旁白: {vo_dur:.1f}s")
-
             if vo_dur > vid_dur:
                 extra = vo_dur - vid_dur + 1.0
                 print(f"   延长静止画面 {extra:.1f}s...")
@@ -943,12 +846,10 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
         else:
             print(f"\n📝 Step 10: 无旁白，输出静音视频")
 
-        # 保存无字幕视频路径，用于缩略图（只展示字，不含字幕文字）
         thumb_source_video = current_video
 
         # Step 11: 淡出 + 字幕
         post_filters = []
-
         if fade_out > 0:
             print(f"\n🌑 Step 11: 淡出 ({fade_out}s)...")
             cur_info = get_video_info(current_video)
@@ -976,25 +877,19 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
             current_video = post_video
             print("   ✅ 后期处理完成")
 
-        # 输出
         shutil.copy2(current_video, output_path)
 
         # 缩略图
-        # 架构变化：封面源帧用 find_best_cover_frame（全视频搜「字最完整+手最少」
-        # 的合成池），而非 find_clean_last_frame_webcam（只看末尾 90 帧、偏向 hold
-        # still 的场景）。两个目标解耦：视频过程看到的最后一帧可以脏，但封面是
-        # 静态图、对干净度要求高得多。
         if generate_thumb:
             thumb_path = os.path.splitext(output_path)[0] + '_thumb.jpg'
             print(f"\n🖼️  生成缩略图...")
             print("   搜索最佳封面源帧（全视频）...")
             import cv2
-            cover_src = find_best_cover_frame(input_path, paper=paper, ink_bbox=ink)
+            cover_src = find_best_cover_frame_phone(working_path, paper=paper, ink_bbox=ink)
             if cover_src is None:
                 print("   ⚠️  全视频未找到干净封面帧，回退到 hold-still 的末尾合成帧")
                 cover_processed = clean_frame_processed
             else:
-                # 对该帧跑与主视频一致的裁剪+缩放+色彩+锐化管线
                 cover_raw_path = os.path.join(tmpdir, 'cover_raw.png')
                 cv2.imwrite(cover_raw_path, cover_src)
                 cover_processed = os.path.join(tmpdir, 'cover_processed.png')
@@ -1011,8 +906,16 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
 
             if cover_processed and os.path.exists(cover_processed):
                 ok = generate_calligraphy_thumbnail(cover_processed, thumb_path,
-                                                     output_width, output_height,
-                                                     medium=detected_medium)
+                                                   output_width, output_height,
+                                                   medium=detected_medium)
+                # 铅笔封面用原始合成帧（未经 pencil-curves 处理）：
+                # generate_calligraphy_thumbnail 的 pencil-curves 会把铅笔灰度
+                # 从 100-180 压到 30-80（接近毛笔），导致 cover 失去铅笔感。
+                # 保存一份 crop+scale+color+sharpen 但未 pencil-curves 的帧，
+                # 供 xhs_cover_pencil.py 使用。
+                cover_frame_path = os.path.splitext(output_path)[0] + '_cover_frame.png'
+                shutil.copy2(cover_processed, cover_frame_path)
+                print(f"   ✅ {cover_frame_path} (pencil cover 源帧)")
             else:
                 ok = False
             if not ok:
@@ -1031,7 +934,10 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
         print(f"   时长: {fi['duration']:.1f}s")
         print(f"   大小: {sz:.1f}MB")
 
-        steps = ["✂️裁剪", f"🔎放大{sf:.1f}x"]
+        steps = []
+        if rotate != 'none':
+            steps.append(f"🔄rotate({rotate})")
+        steps.extend(["✂️裁剪", f"🔎放大{sf:.1f}x"])
         if enable_color_correct:
             steps.append("🎨色彩")
         steps.append("🔍锐化")
@@ -1058,13 +964,14 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
 
 def main():
     parser = argparse.ArgumentParser(
-        description=f'极客禅·墨 Webcam 处理器 v{VERSION}',
+        description=f'极客禅·墨 Phone 处理器 v{VERSION}',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python3 webcam_ink_processor.py input.mp4 -o output.mp4
-  python3 webcam_ink_processor.py input.mp4 -o output.mp4 --text "旁白文本"
-  python3 webcam_ink_processor.py input.mp4 -o output.mp4 --fill 0.7
+  python3 phone_ink_processor.py input.mp4 -o output.mp4
+  python3 phone_ink_processor.py input.mp4 -o output.mp4 --medium pencil
+  python3 phone_ink_processor.py input.mp4 -o output.mp4 --rotate cw
+  python3 phone_ink_processor.py input.mp4 -o output.mp4 --text "旁白文本"
         """
     )
 
@@ -1072,8 +979,8 @@ def main():
     parser.add_argument('--output', '-o', default='output.mp4', help='输出文件路径')
     parser.add_argument('--voiceover', '-v', help='旁白音频文件')
 
-    parser.add_argument('--fill', '-f', type=float, default=DEFAULT_FILL_RATIO,
-                        help=f'字占画面比例 (默认: {DEFAULT_FILL_RATIO})')
+    parser.add_argument('--fill', '-f', type=float, default=PHONE_FILL_RATIO,
+                        help=f'字占画面比例 (默认: {PHONE_FILL_RATIO})')
     parser.add_argument('--hold', type=float, default=DEFAULT_HOLD_SECONDS,
                         help=f'停留秒数 (默认: {DEFAULT_HOLD_SECONDS})')
     parser.add_argument('--width', type=int, default=DEFAULT_OUTPUT_WIDTH,
@@ -1087,13 +994,15 @@ def main():
                         help=f'淡出秒 (默认: {DEFAULT_FADE_OUT})')
     parser.add_argument('--no-color-correct', action='store_true', help='跳过白平衡')
     parser.add_argument('--no-thumbnail', action='store_true', help='不生成缩略图')
-    parser.add_argument('--debug', action='store_true', help='保存检测调试图 (paper_debug.png, ink_webcam_debug.png)')
+    parser.add_argument('--debug', action='store_true',
+                        help='保存检测调试图 (phone_paper_debug.png, ink_phone_debug.png)')
+
     parser.add_argument('--medium', choices=['auto', 'brush', 'pencil'], default='auto',
-                        help='书写介质：brush=毛笔(墨色深), pencil=铅笔(笔迹浅), auto=自动 (默认: auto)')
+                        help='书写介质 (默认: auto)')
     parser.add_argument('--char-region',
-                        help='手动指定字符区域，跳过自动检测（适合极淡铅笔/lined paper）。'
-                             '格式: "cx,cy" 或 "cx,cy,w,h" 或 "x:y:w:h"。'
-                             '数值<1视为画面比例，否则为像素。例: "0.55,0.5" 或 "1900,1100,800,800"')
+                        help='手动指定字符区域，跳过自动检测。格式同 webcam 版。')
+    parser.add_argument('--rotate', choices=['none', 'cw', 'ccw', '180'], default='none',
+                        help='视频 rotate 预处理 (默认: none，即不 rotate)')
 
     parser.add_argument('--subtitle', help='静态字幕文字')
     parser.add_argument('--font', default=DEFAULT_FONT, help=f'字体路径 (默认: {DEFAULT_FONT})')
@@ -1129,7 +1038,7 @@ def main():
 
     check_dependencies()
 
-    process_webcam_video(
+    process_phone_video(
         input_path=args.input,
         output_path=args.output,
         voiceover_path=args.voiceover,
@@ -1148,6 +1057,7 @@ def main():
         debug=args.debug,
         medium=args.medium,
         char_region=args.char_region,
+        rotate=args.rotate,
     )
 
 

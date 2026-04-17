@@ -548,23 +548,116 @@ def find_clean_last_frame(video_path, rotation='none'):
 # Step ⑥: 白平衡/亮度校正参数
 # ============================================================
 
-def build_color_correction_filter():
+def build_color_correction_filter(paper_p95: float = None,
+                                  target_white: float = 240.0) -> str:
     """
-    生成白平衡和亮度校正的 ffmpeg 滤镜。
+    生成白平衡/亮度校正的 ffmpeg 滤镜。
 
-    目标：
-    - 白纸变成真正的白色（去除灯光偏色）
-    - 墨迹变成更深的黑色（增加对比度）
-    - 整体画面明亮干净
-    - 不影响肤色色相（只调亮度通道，不动色度）
+    两种模式：
 
-    使用 eq 滤镜在 YUV 空间调节亮度/对比度，
-    避免 curves=all 对 RGB 同时处理导致肤色偏黄。
+    **自适应模式** (`paper_p95` 传入实测值)：
+      用 lutyuv 对 Y 通道做线性 gain 归一化，把纸面 p95 映射到 target_white。
+      下游假设「纸面近白」的代码（generate_calligraphy_thumbnail 的 pencil
+      curves、xhs_cover 的 flat_field）天然满足假设，不再级联失败。
+      不动 chroma → 颜色保真。
+
+    **Fallback 模式** (`paper_p95=None`)：
+      保留老的固定 eq，兼容未传参的调用路径（如 ink_video_processor 自己
+      的 process_video 仍走老路径）。
+
+    Args:
+        paper_p95: 实测纸面 p95 亮度（0-255）。由 sample_paper_brightness 算出。
+        target_white: 目标纸面亮度，默认 240。设 240 而非 255 是给笔锋/飞白
+                      留动态范围（避免 clip 掉近白像素）。
     """
-    # brightness: 提亮白纸 (+0.06)
-    # contrast: 加大黑白反差 (1.25x) — 让墨迹更黑、纸面更白
-    # saturation: 保持原色 (1.0)
-    return "eq=brightness=0.06:contrast=1.25:saturation=1.0"
+    if paper_p95 is None or paper_p95 <= 0:
+        # 老路径 — 为 webcam 原始录制条件（mean≈195）手调的固定 eq
+        return "eq=brightness=0.06:contrast=1.25:saturation=1.0"
+
+    gain = target_white / max(float(paper_p95), 1.0)
+    # 安全边界：gain 极端时会放大噪点或 clip 掉字
+    gain = min(max(gain, 0.8), 2.5)
+
+    # v5 审美精修：归一化 + 去噪两步组合。
+    # gain=1.4+ 会把纸面真实的纤维纹理和微小光照不均一起放大，输出像"水泥墙"。
+    # 在 lutyuv 之后、下游锐化之前插 hqdn3d，平掉低频纸噪但保留笔画边缘。
+    # 参数 4:3:6:4.5 = luma_spatial:chroma_spatial:luma_tmp:chroma_tmp，
+    # 经典"去纸面/保边"组合；temporal 分量利用多帧相关性，静态纸面受益最大。
+    # `\,` 转义见 lutyuv 说明；hqdn3d 自身无内部逗号，不需要额外转义。
+    return (
+        f"lutyuv=y='clip(val*{gain:.4f}\\,0\\,255)',"
+        f"hqdn3d=4:3:6:4.5"
+    )
+
+
+def sample_paper_brightness(video_path: str,
+                            paper_mask=None,
+                            frame_position: str = 'last') -> float:
+    """
+    采样纸面区域的 p95 亮度，用作色彩校正的归一化锚点。
+
+    **淡出鲁棒性**：若输入视频自带 fade-out（比如用户把上一轮输出当输入重跑），
+    最后一帧会是近黑，单帧采样会得出 p95≈16，触发最大 gain (2.5)，把本来
+    已经白的纸拉到过曝。改为扫描多个候选帧（offsets 30,60,120,240 以及中间帧），
+    取第一个 mean > 100（未淡出）的帧测 p95。若全部候选都淡出，回退到默认 240。
+
+    Args:
+        video_path: 视频路径
+        paper_mask: 二值 mask (H, W) uint8，255 标记纸面。None 则用整帧。
+        frame_position: 兼容性保留；函数内部会尝试多个位置。
+
+    Returns:
+        纸面 p95 亮度（0-255 float）。失败时返回 240.0（gain≈1.0 → 画面不变）。
+    """
+    import cv2
+    import numpy as np
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            cap.release()
+            return 240.0
+
+        # 候选帧：从尾向前跳过 fade-out 区（典型 fade=1s=30 帧 @ 30fps），
+        # 再加中间帧作二次兜底。顺序按「越接近视频结尾（书写已完成）越靠前」排序。
+        candidates = [30, 60, 120, 240, total // 2, total // 4]
+        # 去重 + 范围夹取
+        seen = set()
+        ordered = []
+        for off in candidates:
+            idx = max(0, min(total - 1, total - off if off <= total else total // 2))
+            if idx in seen:
+                continue
+            seen.add(idx)
+            ordered.append(idx)
+
+        for idx in ordered:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if float(np.mean(gray)) < 100:
+                # 整帧均值太低 → 很可能还在淡出/淡入区
+                continue
+
+            if paper_mask is not None and paper_mask.shape == gray.shape:
+                pixels = gray[paper_mask > 0]
+                if pixels.size < 100:
+                    pixels = gray.ravel()
+            else:
+                pixels = gray.ravel()
+
+            cap.release()
+            return float(np.percentile(pixels, 95))
+
+        cap.release()
+        print("   ⚠️  所有候选帧均过暗（可能全视频淡出），使用默认值 240")
+        return 240.0
+    except Exception as e:
+        print(f"   ⚠️  纸面亮度采样失败（{e}），使用默认值 240")
+        return 240.0
 
 
 # ============================================================

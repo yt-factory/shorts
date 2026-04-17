@@ -8,7 +8,8 @@ Part of the [YT-Factory](../CLAUDE.md) platform. Processes handwritten calligrap
 |-----------|--------|------|----------------|
 | **Phone** | `ink_video_processor.py` | Phone (back camera, upside-down) | Auto-rotation (180°/90° CW/CCW) based on book edge detection |
 | **Webcam** | `webcam_ink_processor.py` | Webcam (4K/1080p, top-down) | No rotation; Otsu + connected-components paper detection; skin-masked ink detection |
-| **XHS Cover** | `xhs_cover.py` | Thumbnail → 小红书封面 (1242×1660) | Ink extraction + anchor-based layout + simplified rendering |
+| **XHS Cover (Brush)** | `xhs_cover.py` | Thumbnail → 小红书封面 (1242×1660) | Ink extraction + anchor-based layout + render_ink rendering |
+| **XHS Cover (Pencil)** | `xhs_cover_pencil.py` | Raw cover frame → 小红书封面 (1242×1660) | Sigmoid background replacement, preserves pencil gray tones |
 
 `webcam_ink_processor.py` imports shared functions (ffmpeg utils, TTS, subtitles, color correction, sharpening, etc.) from `ink_video_processor.py`.
 
@@ -91,6 +92,18 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - **Size**: single char = 48% canvas width, multi-char = 70% (`--char` length determines mode).
 - **Title auto-sizing**: reduces by char count, then by rendered width until within 90% canvas width.
 
+**XHS Cover Pencil (`xhs_cover_pencil.py`):**
+- **Input source**: `xxx_cover_frame.png` — the raw composite frame (crop+scale+color+sharpen) BEFORE `generate_calligraphy_thumbnail`'s pencil-curves processing. NOT the thumb (which has pencil gray crushed to near-black).
+- **Design**: "方向 A 极简留白" — pure BG_COLOR background (no texture noise), character floats directly on white.
+- **Rendering**: Sigmoid background replacement + `*0.8` darkening. No render_ink, no alpha-based tone, no ink_color. RGB channels carry the original pencil grayscale directly.
+- **Character detection**: Adaptive threshold (C=12) + connected-component spatial filter (area<200 deleted; 200-800 kept if near anchor, deleted if far; >800 always kept).
+- **Paper cleanup**: Grayscale snap (result_mean > bg_mean-45 → snap to BG_COLOR) + morphological open (5x5 ellipse) removes isolated paper texture survivors. No ink_detect mask dependency.
+- **Edge blend**: 8% bbox-edge feather ramp blends sigmoid result toward BG_COLOR at bbox boundary.
+- **Per-channel BG_COLOR**: Sigmoid targets (245, 240, 235) per-channel, not a single gray mean — eliminates color-mismatch rectangle.
+- **Layout**: Same as brush version — char center at 37%, single char 28% width, golden ratio positioning.
+- **Makefile routing**: `phone-full` defaults to pencil cover; only `MEDIUM=brush` routes to `xhs_cover.py`. Standalone: `make pencil-cover`.
+- **`phone_ink_processor.py` change**: Saves `xxx_cover_frame.png` (copy of `cover_processed` before tmpdir cleanup) for pencil cover input.
+
 ### Constants
 
 | Constant | Value | Notes |
@@ -108,7 +121,13 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 ## Quick Reference
 
 ```bash
-# Phone: one-shot (import → process → XHS cover → export video+thumb+cover)
+# Phone pencil: one-shot (import → process → pencil cover → export)
+make phone-full IN=she.mp4 CHAR="舍" TITLE="舍得之间" TF=/tmp/she.txt ROTATE=cw
+
+# Phone brush: one-shot (same but routes to xhs_cover.py)
+make phone-full IN=zhi.mp4 CHAR="知" TITLE="标题" MEDIUM=brush
+
+# Old phone pipeline (ink_video_processor.py, not phone_ink_processor.py)
 make short-full IN=guan.mp4 CHAR="观" TITLE="观自在菩萨"
 make short-full IN=guan.mp4 CHAR="观" TITLE="标题" TEXT="旁白"  # With TTS
 
@@ -130,8 +149,11 @@ make webcam-full IN=she.mp4 CHAR="舍" TITLE="标题" MEDIUM=pencil COVER_STYLE=
 make short IN=zhi.mp4
 make webcam IN=xi.mp4
 
-# XHS cover only (from existing thumb)
+# XHS cover only — brush (from existing thumb)
 make xhs-cover IN=xi.mp4 CHAR="息" TITLE="标题"
+
+# XHS cover only — pencil (from existing cover_frame)
+make pencil-cover IN=she.mp4 CHAR="舍" TITLE="标题"
 
 # Options
 make shorts-help / make webcam-help / make xhs-help

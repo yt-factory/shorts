@@ -44,10 +44,13 @@ TITLE_COLOR = (45, 42, 38)       # 深棕黑
 SUBTITLE_COLOR = (155, 148, 140) # 暖灰色
 STAMP_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'files', 'seal', 'chan_seal.png')
 
-# 布局：以圆点为锚点，字往上长，文字往下长
-DIVIDER_Y_RATIO = 0.52           # 圆点（视觉中心锚点）
+# 布局：v5 改为以「字中心」为锚点落在黄金分割点
+# 旧版用 DIVIDER_Y_RATIO=0.52 作为字底边 + 圆点的固定位置，
+# 字中心会随 target_h 漂移（方字中心高、宽字中心低）——视觉重心不稳。
+# 新版定字中心 = 38%（视觉黄金分割），圆点 / 标题位置从字底边动态派生。
+CHAR_CENTER_Y_RATIO = 0.38       # 字的视觉中心落在画面高度 38% 处（黄金分割）
 CHAR_GAP_RATIO = 0.03            # 字底边到圆点的呼吸间距
-TOP_MIN_RATIO = 0.10             # 字顶边不超出此位置
+TOP_MIN_RATIO = 0.10             # 字顶边不超出此位置（保护稀有超高字）
 
 # 字体
 SERIF_FONT = '/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc'
@@ -57,6 +60,19 @@ SERIF_BOLD = '/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc'
 CJK_SC_INDEX = 2
 # WSL Windows 字体路径（备选）
 WIN_SIMKAI = '/mnt/c/Windows/Fonts/simkai.ttf'
+
+# v5 审美精修：标题字体优先级
+# 旧版只用 NotoSerifCJK，字形方正均匀，"PPT 标题"感强，和手写书法气质不搭。
+# 新版优先霞鹜文楷 Bold（接近手写楷书），再降级到思源宋体 Heavy，最后落回 Noto。
+# 每项是 (路径, TTC 子字体索引)；非 TTC 字体 index 填 0 即可。
+TITLE_FONT_CANDIDATES = [
+    ('/usr/share/fonts/truetype/lxgw-wenkai/LXGWWenKai-Bold.ttf', 0),
+    ('/usr/share/fonts/opentype/source-han-serif/SourceHanSerifSC-Heavy.otf', 0),
+    (SERIF_BOLD, CJK_SC_INDEX),
+    (SERIF_FONT, CJK_SC_INDEX),
+    (WIN_SIMKAI, 0),
+]
+_title_font_hint_shown = False
 
 
 # ============================================================
@@ -72,14 +88,19 @@ def _load_font(path: str, size: int, index: int = 0) -> ImageFont.FreeTypeFont:
 
 
 def load_title_font(size: int) -> ImageFont.FreeTypeFont:
-    """加载标题字体（衬线体优先）"""
-    for path in [SERIF_BOLD, SERIF_FONT]:
-        f = _load_font(path, size, CJK_SC_INDEX)
-        if f:
-            return f
-    f = _load_font(WIN_SIMKAI, size)
-    if f:
-        return f
+    """加载标题字体。按 TITLE_FONT_CANDIDATES 优先级尝试，首次未命中霞鹜文楷时
+    打印一行提示（安装命令），此后静默避免日志噪音。"""
+    global _title_font_hint_shown
+    for i, (path, index) in enumerate(TITLE_FONT_CANDIDATES):
+        if os.path.exists(path):
+            f = _load_font(path, size, index)
+            if f:
+                # 命中非首选（非霞鹜文楷）时一次性提示升级方案
+                if i > 0 and not _title_font_hint_shown:
+                    print("   💡 标题字体提示：未找到霞鹜文楷，回退到 "
+                          f"{os.path.basename(path)}。建议 sudo apt install fonts-lxgw-wenkai 获得手写感更强的封面。")
+                    _title_font_hint_shown = True
+                return f
     return ImageFont.load_default()
 
 
@@ -337,14 +358,21 @@ def extract_calligraphy(thumb_path: str, char: str = "",
     alpha = np.clip(255.0 - flat_for_alpha.astype(np.float32), 0, 255)
     alpha[alpha < 25] = 0
 
-    # 边缘羽化
-    feather = max(3, int(min(ch_w, ch_h) * 0.04))
+    # v5 审美精修：去字周「白色光晕」
+    # 旧实现 4% 线性 ramp 让 alpha 在 12-20 px 内线性过渡，在 composite 阶段
+    # 这条 ramp 被当成"字的一部分"渲染，形成字外 1-2% 的白色光晕（类似 PS 外发光）。
+    # 极客禅目标是"字直接写在纸上"的干净感，不要这种光晕。
+    # 新实现：feather 1%（原 4%）+ smoothstep（原 linear）——过渡区域更窄、曲线更陡，
+    # 消除 ramp 尾部的"字边缘轻 alpha 带"。
+    feather = max(2, int(min(ch_w, ch_h) * 0.01))
     fade = np.ones((ch_h, ch_w), dtype=np.float32)
-    ramp = np.linspace(0, 1, feather)
-    fade[:feather, :] *= ramp[:, None]
-    fade[ch_h - feather:, :] *= ramp[::-1, None]
-    fade[:, :feather] *= ramp[None, :]
-    fade[:, ch_w - feather:] *= ramp[None, ::-1]
+    ramp = np.linspace(0, 1, feather, dtype=np.float32)
+    # smoothstep: y = x² (3 - 2x)，两端导数为 0，中段陡——视觉过渡柔但窄
+    ramp_ss = ramp * ramp * (3.0 - 2.0 * ramp)
+    fade[:feather, :] *= ramp_ss[:, None]
+    fade[ch_h - feather:, :] *= ramp_ss[::-1, None]
+    fade[:, :feather] *= ramp_ss[None, :]
+    fade[:, ch_w - feather:] *= ramp_ss[None, ::-1]
     alpha *= fade
     alpha = np.clip(alpha, 0, 255).astype(np.uint8)
 
@@ -505,19 +533,22 @@ def generate_cover(thumb_path: str,
     mode = "多字" if is_multi else "单字"
     print(f"   墨迹尺寸: {cw}x{ch} (宽高比={aspect:.2f}, char='{char}' → {mode}模式)")
 
-    # --- 锚点布局 ---
-    divider_y = int(cover_height * DIVIDER_Y_RATIO)   # 52%
-    char_gap = int(cover_height * CHAR_GAP_RATIO)      # 3%
-    top_min = int(cover_height * TOP_MIN_RATIO)         # 10%
-    char_bottom = divider_y - char_gap  # 字底边固定位置
+    # --- 锚点布局（v5：字中心锚 38% 黄金分割点） ---
+    char_gap = int(cover_height * CHAR_GAP_RATIO)        # 3%
+    top_min = int(cover_height * TOP_MIN_RATIO)          # 10%
+    char_center_y = int(cover_height * CHAR_CENTER_Y_RATIO)  # 38%
 
-    # 统一目标尺寸
+    # v5 审美精修：极致留白
+    # 旧比例 0.48 / 0.70 让字在画面几乎占 50%+，偏"课本插图"。
+    # 小红书高赞书法封面的字普遍占画面 15-25%，靠大量留白留出呼吸感。
+    # 单字 0.28、多字 0.45 — 单字按宽度定字号，多字保留横向排布空间。
+    # max_h 同步下调避免纵向溢出（单字 aspect≈1、多字 aspect>2）。
     if is_multi:
-        max_w = int(cover_width * 0.70)
-        max_h = int(cover_height * 0.40)
+        max_w = int(cover_width * 0.45)
+        max_h = int(cover_height * 0.22)
     else:
-        max_w = int(cover_width * 0.48)
-        max_h = int(cover_height * 0.35)
+        max_w = int(cover_width * 0.28)
+        max_h = int(cover_height * 0.22)
 
     scale_w = max_w / cw
     scale_h = max_h / ch
@@ -525,14 +556,14 @@ def generate_cover(thumb_path: str,
     target_w = int(cw * scale)
     target_h = int(ch * scale)
 
-    # 如果字太高（顶边超出 top_min），缩小
-    paste_y = char_bottom - target_h
+    # v5：字中心定在 38% → paste_y 从 target_h 反推；保留 top_min 边界保护
+    paste_y = char_center_y - target_h // 2
     if paste_y < top_min:
-        target_h = char_bottom - top_min
-        scale = target_h / ch
-        target_w = int(cw * scale)
-        target_h = int(ch * scale)
-        paste_y = char_bottom - target_h
+        paste_y = top_min
+
+    # 派生 char_bottom / divider_y / title_y（不再是固定常量）
+    char_bottom = paste_y + target_h
+    divider_y = char_bottom + char_gap   # 圆点在字底下方 3% 处
 
     paste_x = (cover_width - target_w) // 2
 
@@ -567,13 +598,35 @@ def generate_cover(thumb_path: str,
         noise = cv2.GaussianBlur(noise, (0, 0), 40)  # sigma=40 → 柔和起伏
         canvas_gray = canvas_gray * 0.94 + noise.astype(np.float64) * 0.06
 
-    # 贴入墨迹
+    # 贴入墨迹（v5：改硬覆盖为 2.5% 边缘渐变的 alpha-blend）
+    # 旧实现 canvas_gray[bbox] = gray_arr 直接覆盖：bbox 内 noise 纹理被擦掉，
+    # 替换成 composite_gray（纸区为无纹理的 bg_gray_val），形成可见的"纸块"方框
+    # — 和米白底有明显色差 + 直角边切。
+    # 新实现：保留 composite_gray 的中心区，但在 bbox 边缘 2.5% 做 smoothstep
+    # 渐变到 canvas_gray —— 纹理 canvas 和 composite 在边缘柔和融合。
     gray_arr = np.array(gray_resized, dtype=np.float64)
     py1, py2 = max(0, paste_y), min(cover_height, paste_y + target_h)
     px1, px2 = max(0, paste_x), min(cover_width, paste_x + target_w)
     sy1, sy2 = py1 - paste_y, py1 - paste_y + (py2 - py1)
     sx1, sx2 = px1 - paste_x, px1 - paste_x + (px2 - px1)
-    canvas_gray[py1:py2, px1:px2] = gray_arr[sy1:sy2, sx1:sx2]
+
+    bh, bw = (py2 - py1), (px2 - px1)
+    # 2.5% 的边缘渐变，smoothstep 曲线（两端导数 0 → 边界自然消失感）
+    ramp_px = max(2, int(min(bh, bw) * 0.025))
+    spatial_blend = np.ones((bh, bw), dtype=np.float64)
+    if 0 < ramp_px * 2 < min(bh, bw):
+        r = np.linspace(0, 1, ramp_px, dtype=np.float64)
+        r_ss = r * r * (3.0 - 2.0 * r)
+        spatial_blend[:ramp_px, :] *= r_ss[:, None]
+        spatial_blend[-ramp_px:, :] *= r_ss[::-1, None]
+        spatial_blend[:, :ramp_px] *= r_ss[None, :]
+        spatial_blend[:, -ramp_px:] *= r_ss[None, ::-1]
+
+    composite_in = gray_arr[sy1:sy2, sx1:sx2]
+    canvas_gray[py1:py2, px1:px2] = (
+        composite_in * spatial_blend
+        + canvas_gray[py1:py2, px1:px2] * (1.0 - spatial_blend)
+    )
 
     canvas_rgb = render_ink(canvas_gray, cover_style=cover_style)
     canvas = Image.fromarray(canvas_rgb, 'RGB')
