@@ -24,7 +24,7 @@ Raw video (phone, any orientation) → auto-detect rotation → ink_video_proces
 ```
 ① Rotation detection (4-edge scan) → ② Stabilize (opt) → ③ Ink detect → ④ Crop → ⑤ Scale
 → ⑥ Color correct → ⑦ Sharpen → ⑧ Fade in → ⑨ Strip audio → ⑩ Hold frame
-→ ⑪.5 TTS (opt) → ⑫ Merge voiceover → ⑪ Fade out → ⑬ Subtitles → ⑭ Thumbnail
+→ ⑪.5 TTS (opt) → ⑫ Merge voiceover → ⑪ Fade out + Subtitles + Seal → ⑭ Thumbnail
 ```
 
 ### Webcam Pipeline (`webcam_ink_processor.py`)
@@ -36,7 +36,7 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 ```
 ① Paper region detect (adaptive threshold) → ② Ink detect (contour mask) → ③ Crop → ④ Scale
 → ⑤ Color correct → ⑥ Sharpen → ⑦ Fade in → ⑧ Strip audio → ⑨ Hold frame
-→ ⑩ TTS/voiceover (opt) → ⑪ Fade out → ⑫ Subtitles → ⑬ Thumbnail
+→ ⑩ TTS/voiceover (opt) → ⑪ Fade out + Subtitles + Seal → ⑬ Thumbnail
 ```
 
 **Critical ordering**: Fade-out must happen AFTER video extension, not before. Otherwise extended frames are black.
@@ -50,6 +50,11 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
   - **TTS budget = video duration, NOT remaining time to 60s.** Audio is mixed at `t=0` and plays simultaneously with the video, not appended after. Setting budget to `SHORTS_MAX_DURATION - cur_dur` (the old bug) would compress 121 chars into ~15s for a 45s video, finishing the narration when only ~36% of writing was done. Correct budget is `min(cur_dur, SHORTS_MAX_DURATION - 1)`.
 - **Calligraphy thumbnail (`generate_calligraphy_thumbnail`)**: Second-pass tight crop on the clean processed frame. Filters out edge-touching contours with extreme aspect ratio (color-correction artifacts at frame borders) before clustering, otherwise they get pulled into the bbox and shift the crop toward the frame edge.
 - **Font**: Default 楷体 (simkai.ttf) via WSL Windows fonts path.
+- **Brand seal overlay (`files/seal/chan_seal.png`)**: Step 11 overlays a "禅" stamp at right-bottom (12% width, 5% margin, 75% opacity) starting 2.5s before fade-out, fading in over 0.5s. Three gotchas that together consumed ~45 min of debug:
+  1. **`-loop 1` required**: a plain `-i PNG` is a 1-frame video; without loop the stamp shows for 1/fps seconds and is invisible.
+  2. **`-t {total_dur}` not `-shortest`**: `-loop 1` makes the stamp stream infinite, so bare ffmpeg encodes forever; `-shortest` then truncates output to whichever stream is shortest — usually the TTS audio, cutting the hold/fade/stamp window off. Explicit `-t` matches the main video duration.
+  3. **Fade `st={stamp_start}` not `st=0`**: fade runs on the stamp stream's own timeline, which (because of `-loop 1`) begins at video t=0. With `st=0` the fade completes at 0.5s, long before overlay enables at 14s, so the stamp pops in at full opacity. Aligning `st` with `stamp_start` makes fade coincide with overlay enable.
+- Fallback: if `files/seal/chan_seal.png` is missing, Step 11 falls back to the original single-input `-vf` chain (fade-out + subtitle only), no seal, no crash.
 
 **Phone-specific:**
 - **Rotation detection**: Scans all 4 edges (top/bottom/left/right) for book spine features (dark pixels + edge density). Maps book edge → rotation to bring book to top. Supports 180°, 90° CW, 90° CCW.

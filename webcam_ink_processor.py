@@ -51,6 +51,10 @@ from ink_video_processor import (
 
 VERSION = "1.0"
 
+# 品牌印章：末尾淡入、随整体淡出消失
+STAMP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'files', 'seal', 'chan_seal.png')
+
 
 # ============================================================
 # Webcam 专用：白纸区域检测
@@ -946,24 +950,108 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
         # 保存无字幕视频路径，用于缩略图（只展示字，不含字幕文字）
         thumb_source_video = current_video
 
-        # Step 11: 淡出 + 字幕
-        post_filters = []
+        # Step 11: 淡出 + 字幕 + 印章
+        stamp_enabled = os.path.exists(STAMP_PATH)
 
+        cur_info = None
+        fade_start = None
         if fade_out > 0:
             print(f"\n🌑 Step 11: 淡出 ({fade_out}s)...")
             cur_info = get_video_info(current_video)
             fade_start = cur_info['duration'] - fade_out
-            post_filters.append(f"fade=t=out:st={fade_start:.2f}:d={fade_out}")
             print(f"   淡出起始: {fade_start:.1f}s (总时长 {cur_info['duration']:.1f}s)")
 
+        subtitle_filter = None
         if tts_srt_path and os.path.exists(tts_srt_path):
             print(f"\n📝 叠加同步字幕（SRT）...")
-            post_filters.append(build_srt_subtitle_filter(tts_srt_path, font_path, output_width, output_height))
+            subtitle_filter = build_srt_subtitle_filter(tts_srt_path, font_path, output_width, output_height)
         elif subtitle_text:
             print(f"\n📝 叠加字幕: \"{subtitle_text}\"")
-            post_filters.append(build_subtitle_filter(subtitle_text, output_width, output_height, font_path))
+            subtitle_filter = build_subtitle_filter(subtitle_text, output_width, output_height, font_path)
 
-        if post_filters:
+        has_effects = (fade_out > 0) or (subtitle_filter is not None)
+
+        if stamp_enabled:
+            # 印章叠加参数
+            stamp_width_ratio = 0.12      # 画面宽度的 12%
+            stamp_margin_ratio = 0.05     # 距边 5%
+            stamp_opacity = 0.75          # 75% 不透明度
+            stamp_fade_in = 0.5           # 淡入时长
+            stamp_hold = 2.0              # 停留时长
+            stamp_lead = stamp_fade_in + stamp_hold  # 印章在淡出前多久出现 = 2.5s
+
+            if cur_info is None:
+                cur_info = get_video_info(current_video)
+            total_dur = cur_info['duration']
+
+            # 印章出现时间：淡出开始前 2.5s；无淡出时为结尾前 3.5s
+            if fade_out > 0:
+                stamp_start = max(0.0, fade_start - stamp_lead)
+            else:
+                stamp_start = max(0.0, total_dur - stamp_lead - 1.0)
+
+            stamp_w = int(output_width * stamp_width_ratio)
+            stamp_margin_x = int(output_width * stamp_margin_ratio)
+            stamp_margin_y = int(output_height * stamp_margin_ratio)
+            overlay_x = output_width - stamp_w - stamp_margin_x
+            overlay_y_expr = f"{output_height}-overlay_h-{stamp_margin_y}"
+
+            # 印章预处理：缩放 + 透明度 + 淡入（alpha=1 只改透明通道）
+            stamp_filters = (
+                f"[1:v]scale={stamp_w}:-1,"
+                f"format=rgba,"
+                f"colorchannelmixer=aa={stamp_opacity},"
+                f"fade=t=in:st={stamp_start:.2f}:d={stamp_fade_in}:alpha=1"
+                f"[stamp]"
+            )
+
+            # overlay 时间窗口：stamp_start 之后才叠印章
+            overlay_filter = (
+                f"[0:v][stamp]overlay="
+                f"x={overlay_x}:y={overlay_y_expr}:"
+                f"enable='gte(t,{stamp_start:.2f})'"
+                f"[stamped]"
+            )
+
+            # 在印章之后叠加淡出和字幕（整体一起淡到黑）
+            post_chain_parts = []
+            if fade_out > 0:
+                post_chain_parts.append(f"fade=t=out:st={fade_start:.2f}:d={fade_out}")
+            if subtitle_filter is not None:
+                post_chain_parts.append(subtitle_filter)
+
+            if post_chain_parts:
+                post_chain = f"[stamped]{','.join(post_chain_parts)}[out]"
+            else:
+                post_chain = "[stamped]copy[out]"
+
+            filter_complex = f"{stamp_filters};{overlay_filter};{post_chain}"
+
+            post_video = os.path.join(tmpdir, 'post_processed.mp4')
+            run_ffmpeg([
+                'ffmpeg', '-y',
+                '-i', current_video,
+                '-loop', '1', '-i', STAMP_PATH,
+                '-filter_complex', filter_complex,
+                '-map', '[out]',
+                '-map', '0:a?',
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+                '-c:a', 'copy',
+                '-pix_fmt', 'yuv420p',
+                '-t', f'{total_dur:.3f}',
+                post_video
+            ], "淡出+字幕+印章")
+            current_video = post_video
+            print(f"   🔴 印章叠加: {stamp_start:.1f}s 淡入, 停留至淡出")
+            print("   ✅ 后期处理完成")
+        elif has_effects:
+            print("ℹ️  未找到印章文件，跳过")
+            post_filters = []
+            if fade_out > 0:
+                post_filters.append(f"fade=t=out:st={fade_start:.2f}:d={fade_out}")
+            if subtitle_filter is not None:
+                post_filters.append(subtitle_filter)
+
             post_video = os.path.join(tmpdir, 'post_processed.mp4')
             run_ffmpeg([
                 'ffmpeg', '-y', '-i', current_video,
@@ -975,6 +1063,8 @@ def process_webcam_video(input_path, output_path, voiceover_path=None,
             ], "淡出+字幕")
             current_video = post_video
             print("   ✅ 后期处理完成")
+        else:
+            print("ℹ️  未找到印章文件，跳过")
 
         # 输出
         shutil.copy2(current_video, output_path)
