@@ -73,8 +73,14 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - **Paper-edge artifact filter**: Contours within 30 px of paper edge AND aspect ratio > 2.5 are dropped (paper folds/shadows).
 - **Clean frame search — two separate paths (video vs cover)**:
   1. `find_clean_last_frame_webcam`: last 90 frames, adaptive brightness floor (85% of window max) to skip fade-outs and dim-paper sources, then 8-frame median composite of the lowest-skin candidates (relative ranking — no absolute 2% threshold). Used for the **hold-still video tail**.
-  2. `find_best_cover_frame`: **full-video scan** (1.5 fps sample + dense tail of last 30 frames). Writers often lift hand briefly only in the last <1s; pure sampling would miss that. Metric is **skin coverage over the character bbox** (direct "hand off the character" signal), NOT ink_area — hand/arm shadow creates false ink signal that inflates ink_area when the hand is on the character. `char_ink ≥ 500` is an existence check. Top-8 by skin_over_char get BGR-reread and median-composited. Returns None if <3 candidates; caller falls back to hold-still frame. Adds ~8s to a 25s 4K video.
-- **Crop constraint bug fixed**: `calculate_crop` uses `y_max - ch` (not `src_h - ch`).
+  2. `find_best_cover_frame` (and phone twin `find_best_cover_frame_phone`): **full-video scan** (1.5 fps sample + dense tail of last 30 frames). Writers often lift hand briefly only in the last <1s; pure sampling would miss that. Two filters work together:
+     1. **Existence**: `char_ink ≥ 500` rules out empty paper.
+     2. **Completeness gate**: among the lowest-skin 16-32 candidates (where hand can't inflate `char_ink` with false dark signal), require `char_ink ≥ 0.7 × that-subset's max`. Without this gate, a writer who briefly pauses with hand off after the FIRST radical (e.g., 奴 of 怒) but before writing the SECOND (e.g., 心) lands a frame with skin=0% and `char_ink > 500` (奴 alone), wins on skin tiebreak, and the cover composite shows only half the character. Computing `ink_max` over the low-skin subset, not all meaningful frames, prevents hand-on-char "fake dark" pixels from inflating the threshold.
+     3. **Skin region = 1.6× character bbox** (30% pad each side), not the tight bbox. Tight bbox-only scoring gives skin=0% to frames where the hand has just slid off the character but is still 100 px to the side, tying them with truly-clean late frames; the wider region penalizes residue-nearby and lets late hand-fully-gone frames win the tiebreak. `char_ink` stays on the tight bbox — it's the "is the character itself written?" signal and would be diluted by paper/shadow if expanded.
+     - Top-8 by skin_over_char get BGR-reread and median-composited. Returns None if <3 candidates; caller falls back to hold-still frame. Adds ~8s to a 25s 4K video.
+- **Crop constraint bugs fixed (`calculate_crop`)**:
+  1. Uses `y_max - ch` (not `src_h - ch`) so book-exclusion zones aren't violated.
+  2. **`safety_pad=0.10` hard floor** on crop dims relative to ink bbox (`crop_w ≥ ink_w × 1.20`, same for height). `min_scale=1.5` previously won at all costs by shrinking the crop window — when ink was already large enough that 1.5× zoom required `crop_w < ink_w`, the algorithm clipped peripheral strokes (nu case: ink 763w, crop forced to 720w → 女 left horizontal + 心 right dot chopped before render). Now `min_scale` yields when it would clip the character.
 - **X-direction crop clamping preserves aspect ratio** when paper is narrower than the calculated crop.
 - **Debug images conditional**: `--debug` controls `paper_debug.png` / `ink_webcam_debug.png`.
 
@@ -83,6 +89,8 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - Pencil switches to `curves=all='0/0 0.5/0.15 0.7/0.1 1/1'` — non-linear map: 128→38, 180→25, paper near-255 untouched. Preserves faint strokes while keeping paper clean.
 
 **XHS Cover (`xhs_cover.py`):**
+- **Spatial clustering — multi-anchor (top-3) union, not single-anchor**: For multi-radical single chars (怒 = 奴 + 心, 想 = 相 + 心 …) the largest single contour is often one radical's heaviest stroke, and a radius of `2 × max(anchor_w, anchor_h)` from its center can't reach the other radical, dropping it from the cluster bbox. The fix takes the top-3 contours by area as anchors and unions their circles, so any contour within radius of ANY anchor is kept. Without this, nu's cover rendered only 心 fragments because 心's bowl was the largest single contour and 奴 sat ~600 px above the bowl center — outside the single-anchor radius.
+- **Edge-touching contour filter**: Drops any contour whose bbox sits within `max(3, 0.5%×min(w,h))` px of the frame border. Real characters never touch the thumbnail edge; wood-grain/paper-fold/table-edge artifacts do, and once captured by the brush threshold they get pulled into the multi-anchor cluster and inflate the bbox.
 - **Ink extraction**: Stage A white-paper detect → **Stage A.5 flat-field correct** → Stage B `classify_medium` + brush/pencil extract on `flat_gray`. Pencil uses simple `flat<220` threshold (works because flat-field pushes paper to ~255) plus `remove_ruled_lines`.
 - **Alpha from `flat_cropped`, not `cropped`** — flat-field has already removed paper shadows, so alpha directly reflects ink density (no false-ink shadow residue).
 - **CLAHE on pencil's alpha source**: `cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))` applied to `flat_cropped` before computing alpha. Pencil strokes often land in 230-245, giving alpha=10-25 (near-transparent); CLAHE pulls them to 60-200, alpha becomes meaningfully opaque. Brush skips CLAHE (already has strong contrast, CLAHE would amplify paper-fiber noise).
@@ -106,8 +114,9 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
 - **Edge blend**: 8% bbox-edge feather ramp blends sigmoid result toward BG_COLOR at bbox boundary.
 - **Per-channel BG_COLOR**: Sigmoid targets (245, 240, 235) per-channel, not a single gray mean — eliminates color-mismatch rectangle.
 - **Layout**: Same as brush version — char center at 37%, single char 28% width, golden ratio positioning.
-- **Makefile routing**: `phone-full` defaults to pencil cover; only `MEDIUM=brush` routes to `xhs_cover.py`. Standalone: `make pencil-cover`.
-- **`phone_ink_processor.py` change**: Saves `xxx_cover_frame.png` (copy of `cover_processed` before tmpdir cleanup) for pencil cover input.
+- **Spatial clustering**: Same multi-anchor (top-3) union as `xhs_cover.py` — same multi-radical bug, same fix.
+- **Makefile routing — auto-detected medium overrides user `MEDIUM=`**: `phone_ink_processor.py` writes a `<output>_medium.txt` sidecar containing the detected medium. The Makefile reads it and uses `effective = sidecar || user-passed MEDIUM` to pick the cover script. Without this, a brush video with no `MEDIUM=brush` flag silently routed through `xhs_cover_pencil.py`, whose adaptive threshold (C=12) misses solid-black brush interiors (only catches edge transitions) → fragmented cluster → cover renders only smudge fragments.
+- **`phone_ink_processor.py` change**: Saves `xxx_cover_frame.png` (copy of `cover_processed` before tmpdir cleanup) for pencil cover input, plus `xxx_medium.txt` sidecar for routing.
 
 ### Constants
 
@@ -185,4 +194,5 @@ make short-export IN=zhi.mp4                     # WSL output → Win Downloads
 - Edge TTS only returns SentenceBoundary (not WordBoundary) for Chinese — subtitles are per-sentence, not per-word
 - Pencil cover depends on the writer briefly lifting hand at end. `find_best_cover_frame` requires ≥3 frames with low skin_over_char; if the writer keeps their hand on the page the entire video, even the best-picked frames will have the hand occluding the character and median composite can't remove it.
 - For extremely faint pencil (reflectance diff <15%), the bbox may still underestimate the full character; use `--char-region` to override.
+- **Cover-frame quality depends on shooting discipline**: hold hand fully out of frame for 2-3 s after the last stroke. The completeness gate + 1.6× skin region picks the best frame the video offers, but if the writer never frees the frame the algorithm has nothing to find. Recommended habit at record time: write last stroke → hand out of shot → count "one, two" → stop recording.
 - `main.py` is a scaffold placeholder, not used

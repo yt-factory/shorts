@@ -258,7 +258,12 @@ def extract_calligraphy(thumb_path: str, char: str = "",
                 detected_medium, None)
 
     # ── Step 2: 过滤 — 只保留"笔画级"轮廓 ──
-    # 排除：桌面条纹（极扁，宽高比 > 8）、微小噪点（面积 < 50px）
+    # 排除：桌面条纹（极扁，宽高比 > 8）、微小噪点（面积 < 50px）、
+    #      触框轮廓（书法字永远不会触帧边，触边的几乎一定是桌面木纹/纸面褶皱/边角阴影）。
+    # nu 案例：thumb 右下角有一块木纹/纸边渐变 smudge，触右下两条边，
+    # 笔触阈值能把它当成轮廓采进来；不过滤掉的话会被多锚点聚类拉进 bbox，
+    # 把字撑成 1076x1915 撑满整张图，单字目标 48% 缩到只剩 17%。
+    EDGE_TOUCH_PX = max(3, int(min(w, h) * 0.005))
     min_area = 50
     strokes = []
     for c in contours:
@@ -267,8 +272,10 @@ def extract_calligraphy(thumb_path: str, char: str = "",
             continue
         x, y, cw, ch = cv2.boundingRect(c)
         aspect = max(cw, ch) / max(min(cw, ch), 1)
-        # 排除桌面条纹：高宽高比 + 横跨画面大部分宽/高
         if aspect > 5 and (cw > w * 0.6 or ch > h * 0.6):
+            continue
+        if (x <= EDGE_TOUCH_PX or y <= EDGE_TOUCH_PX or
+                x + cw >= w - EDGE_TOUCH_PX or y + ch >= h - EDGE_TOUCH_PX):
             continue
         strokes.append(c)
 
@@ -278,26 +285,38 @@ def extract_calligraphy(thumb_path: str, char: str = "",
                 detected_medium, None)
 
     # ── Step 3: 空间聚类 — 找到主字群 ──
-    # 以最大笔画为锚点，保留距离在 3× 半径内的笔画
-    anchor = max(strokes, key=cv2.contourArea)
-    ax, ay, aw, ah = cv2.boundingRect(anchor)
-    acx, acy = ax + aw // 2, ay + ah // 2
-    # 聚类半径：单字用紧半径避免桌面碎片，多字用宽半径连接多个字
+    # 多锚点 union：单一最大轮廓做锚点对多偏旁字（如 怒 = 奴 + 心）会失败 ——
+    # 当一个偏旁的最大笔画远小于整字纵向跨度时，以此为圆心的半径够不到另一偏旁。
+    # nu 案例：心 的 bowl 是单字最大单笔画，半径 = 2*max(bowl_w, bowl_h) 仅 ~800,
+    # 但 奴 在 bowl 上方 ~600-800px，不在簇内 → 桌面 cover 只剩 心 碎片。
+    # 修复：取面积前 3 名各做锚点，任一锚点圆内的轮廓都纳入簇。
+    sorted_strokes = sorted(strokes, key=cv2.contourArea, reverse=True)
+    top_anchors = sorted_strokes[:3]
     if len(char) > 1:
-        radius = max(aw, ah) * 3
+        radius_mult = 3.0
     else:
-        radius = max(aw, ah) * 2.0
+        radius_mult = 2.0
+
+    anchor_circles = []
+    for a in top_anchors:
+        ax, ay, aw, ah = cv2.boundingRect(a)
+        anchor_circles.append((
+            ax + aw // 2, ay + ah // 2,
+            max(aw, ah) * radius_mult,
+        ))
 
     clustered = []
     for c in strokes:
         bx, by, bw_c, bh_c = cv2.boundingRect(c)
         mcx = bx + bw_c // 2
         mcy = by + bh_c // 2
-        if abs(mcx - acx) < radius and abs(mcy - acy) < radius:
-            clustered.append(c)
+        for (acx, acy, r) in anchor_circles:
+            if abs(mcx - acx) < r and abs(mcy - acy) < r:
+                clustered.append(c)
+                break
 
     if not clustered:
-        clustered = [anchor]
+        clustered = [sorted_strokes[0]]
 
     # 合并边界框
     pts = np.vstack(clustered)

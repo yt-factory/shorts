@@ -172,19 +172,26 @@ def extract_pencil_calligraphy(thumb_path: str, char: str = "") -> Image.Image:
     if not strokes:
         strokes = [max(contours, key=cv2.contourArea)]
 
-    # 空间聚类：以最大笔画为锚点
-    anchor = max(strokes, key=cv2.contourArea)
-    ax, ay, aw, ah = cv2.boundingRect(anchor)
-    acx, acy = ax + aw // 2, ay + ah // 2
-    radius = max(aw, ah) * (3 if len(char) > 1 else 2)
+    # 空间聚类：多锚点 union（修复多偏旁单字的失败模式 — 详见 xhs_cover.py 同名段注释）
+    sorted_strokes = sorted(strokes, key=cv2.contourArea, reverse=True)
+    top_anchors = sorted_strokes[:3]
+    radius_mult = 3.0 if len(char) > 1 else 2.0
+    anchor_circles = []
+    for a in top_anchors:
+        ax, ay, aw, ah = cv2.boundingRect(a)
+        anchor_circles.append((ax + aw // 2, ay + ah // 2, max(aw, ah) * radius_mult))
 
-    clustered = [
-        c for c in strokes
-        if (abs(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] // 2 - acx) < radius
-            and abs(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] // 2 - acy) < radius)
-    ]
+    clustered = []
+    for c in strokes:
+        bx, by, bw_c, bh_c = cv2.boundingRect(c)
+        mcx = bx + bw_c // 2
+        mcy = by + bh_c // 2
+        for (acx, acy, r) in anchor_circles:
+            if abs(mcx - acx) < r and abs(mcy - acy) < r:
+                clustered.append(c)
+                break
     if not clustered:
-        clustered = [anchor]
+        clustered = [sorted_strokes[0]]
 
     pts = np.vstack(clustered)
     x_min, y_min, bw, bh = cv2.boundingRect(pts)

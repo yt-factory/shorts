@@ -684,10 +684,20 @@ def find_best_cover_frame(video_path, paper=None, ink_bbox=None, sample_fps=1.5)
         print(f"      ⚠️  全视频字符 bbox 内暗像素 max={ink_max} <500，字未写")
         return None
 
+    # Completeness gate: among low-skin candidates (where hand can't inflate
+    # char_ink with false dark signal), require char_ink within 70% of that
+    # subset's max. Prevents picking "hand off after first radical but before
+    # second radical" frames for multi-radical characters (e.g. 怒 = 奴 + 心).
     meaningful.sort(key=lambda s: s[1])  # skin_over_char 升序
-    pool_stats = meaningful[:8]
+    low_skin_pool = meaningful[:max(16, min(32, len(meaningful)))]
+    ink_max_clean = max(s[2] for s in low_skin_pool)
+    COMPLETENESS_RATIO = 0.7
+    complete = [s for s in low_skin_pool if s[2] >= ink_max_clean * COMPLETENESS_RATIO]
+    pool_stats = complete[:8]
     print(f"      有字候选 {len(meaningful)} 帧 (char_ink≥{MIN_CHAR_INK}), "
-          f"取 skin_over_char 最低前 {len(pool_stats)}")
+          f"低 skin 池 {len(low_skin_pool)} 帧 (clean ink_max={ink_max_clean}), "
+          f"完整候选 {len(complete)} 帧 (char_ink≥{int(ink_max_clean * COMPLETENESS_RATIO)}), "
+          f"取前 {len(pool_stats)} 合成")
     if len(pool_stats) < 3:
         cap.release()
         print(f"      ⚠️  可用候选仅 {len(pool_stats)} 帧，不足以合成")

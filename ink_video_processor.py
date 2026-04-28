@@ -1233,12 +1233,18 @@ def generate_calligraphy_thumbnail(clean_frame_processed_path, output_path,
 # ============================================================
 
 def calculate_crop(ink, src_w, src_h, fill_ratio, out_w, out_h,
-                   min_scale=DEFAULT_MIN_SCALE, y_min=0, y_max=0):
+                   min_scale=DEFAULT_MIN_SCALE, y_min=0, y_max=0,
+                   safety_pad=0.10):
     """
     根据墨迹位置和目标填充比例，计算裁剪区域。
     保持输出的 9:16 宽高比。
     保证最小放大倍数（即使墨迹区域很大也会放大）。
     裁剪框不会延伸到 y_min 之上或 y_max 之下（避免包含书脊）。
+
+    safety_pad: 裁剪框相对墨迹 bbox 的最小外扩（每边）。墨迹检测难免漏掉
+        外缘细笔画（如 nu 案例的 女 一橫 / 心 右点），且 fill_ratio 过紧时
+        min_scale 强制还会进一步把窗口压到 ink_w 之下，把字切了。
+        默认 0.10 = 每边至少留 10%，再叠 fill_ratio / aspect / min_scale。
 
     Returns:
         dict: {'x', 'y', 'w', 'h', 'scale_factor'}
@@ -1263,6 +1269,22 @@ def calculate_crop(ink, src_w, src_h, fill_ratio, out_w, out_h,
     if min_scale > 1.0 and out_w / cw < min_scale:
         cw = int(out_w / min_scale)
         ch = int(cw / aspect)
+        cw = min(cw, src_w)
+        ch = min(ch, src_h)
+
+    # 安全垫：min_scale / aspect 调整后，裁剪框绝不应该比墨迹 bbox + safety_pad 小，
+    # 否则角上的笔画会被切掉。nu 案例：ink_w=763, min_scale 把 cw 压到 720 < 763，
+    # 女的左一横和心的右点直接超出画面。这一关把 cw 推回 ≥ ink_w*(1+2*pad)。
+    min_cw_for_ink = int(ink['w'] * (1.0 + 2.0 * safety_pad))
+    min_ch_for_ink = int(ink['h'] * (1.0 + 2.0 * safety_pad))
+    if cw < min_cw_for_ink or ch < min_ch_for_ink:
+        cw = max(cw, min_cw_for_ink)
+        ch = max(ch, min_ch_for_ink)
+        # 重新对齐 9:16
+        if cw / ch > aspect:
+            ch = int(cw / aspect)
+        else:
+            cw = int(ch * aspect)
         cw = min(cw, src_w)
         ch = min(ch, src_h)
 

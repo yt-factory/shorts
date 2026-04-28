@@ -594,9 +594,24 @@ def find_best_cover_frame_phone(video_path, paper=None, ink_bbox=None, sample_fp
             cbw = w_ // 3; cbh = h_ // 3
         ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
         skin = cv2.inRange(ycrcb, skin_lo, skin_hi)
-        char_skin = skin[cby:cby + cbh, cbx:cbx + cbw]
+        # Expanded skin region: 1.6× the char bbox (centered) so the score also
+        # penalizes hand/brush residue that has just LEFT the character but
+        # still sits in the frame near it. The narrow bbox-only check let nu's
+        # cover keep a brush-tip trail in the bottom-right corner — many
+        # candidate frames scored skin=0% inside the bbox while the hand was
+        # still drifting off to the side.
+        ex_pad_x = cbw * 3 // 10
+        ex_pad_y = cbh * 3 // 10
+        ex = max(0, cbx - ex_pad_x)
+        ey = max(0, cby - ex_pad_y)
+        ew = min(w_ - ex, cbw + 2 * ex_pad_x)
+        eh = min(h_ - ey, cbh + 2 * ex_pad_y)
+        char_skin = skin[ey:ey + eh, ex:ex + ew]
         skin_over_char = float((char_skin > 0).mean()) if char_skin.size else 1.0
         flat = ie.flat_field_correct(gray)
+        # Keep char_ink on the tight bbox — that's the "is the character itself
+        # written?" signal; expanding it would let nearby paper/shadow inflate
+        # the count and break the completeness gate.
         char_flat = flat[cby:cby + cbh, cbx:cbx + cbw]
         char_ink = int((char_flat < 200).sum()) if char_flat.size else 0
         stats.append((idx, skin_over_char, char_ink))
@@ -613,10 +628,22 @@ def find_best_cover_frame_phone(video_path, paper=None, ink_bbox=None, sample_fp
         print(f"      ⚠️  全视频字符 bbox 内暗像素 max={ink_max} <500，字未写")
         return None
 
-    meaningful.sort(key=lambda s: s[1])
-    pool_stats = meaningful[:8]
+    # Completeness gate: among low-skin candidates (where hand can't inflate
+    # char_ink with false dark signal), require char_ink within 70% of that
+    # subset's max. Prevents picking "hand briefly off after 奴 but before 心"
+    # frames for multi-radical characters (bug that lost 心 in nu's cover).
+    # Computing ink_max over all meaningful would be skewed by hand-on-char
+    # frames; restricting to low-skin frames isolates the real character signal.
+    meaningful.sort(key=lambda s: s[1])  # skin_over_char ascending
+    low_skin_pool = meaningful[:max(16, min(32, len(meaningful)))]
+    ink_max_clean = max(s[2] for s in low_skin_pool)
+    COMPLETENESS_RATIO = 0.7
+    complete = [s for s in low_skin_pool if s[2] >= ink_max_clean * COMPLETENESS_RATIO]
+    pool_stats = complete[:8]
     print(f"      有字候选 {len(meaningful)} 帧 (char_ink≥{MIN_CHAR_INK}), "
-          f"取 skin_over_char 最低前 {len(pool_stats)}")
+          f"低 skin 池 {len(low_skin_pool)} 帧 (clean ink_max={ink_max_clean}), "
+          f"完整候选 {len(complete)} 帧 (char_ink≥{int(ink_max_clean * COMPLETENESS_RATIO)}), "
+          f"取前 {len(pool_stats)} 合成")
     if len(pool_stats) < 3:
         cap.release()
         print(f"      ⚠️  可用候选仅 {len(pool_stats)} 帧，不足以合成")
@@ -1007,6 +1034,16 @@ def process_phone_video(input_path, output_path, voiceover_path=None,
                 cover_frame_path = os.path.splitext(output_path)[0] + '_cover_frame.png'
                 shutil.copy2(cover_processed, cover_frame_path)
                 print(f"   ✅ {cover_frame_path} (pencil cover 源帧)")
+
+                # Sidecar: detected medium for downstream cover-script routing.
+                # Without this, the Makefile only sees user-passed MEDIUM and
+                # silently routes brush content through xhs_cover_pencil.py,
+                # whose adaptive threshold chokes on solid-black brush
+                # interiors and produces fragmented covers.
+                medium_path = os.path.splitext(output_path)[0] + '_medium.txt'
+                with open(medium_path, 'w') as f:
+                    f.write(detected_medium + '\n')
+                print(f"   ✅ {medium_path} ({detected_medium})")
             else:
                 ok = False
             if not ok:
