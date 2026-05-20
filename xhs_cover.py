@@ -557,17 +557,17 @@ def generate_cover(thumb_path: str,
     top_min = int(cover_height * TOP_MIN_RATIO)          # 10%
     char_center_y = int(cover_height * CHAR_CENTER_Y_RATIO)  # 38%
 
-    # v5 审美精修：极致留白
-    # 旧比例 0.48 / 0.70 让字在画面几乎占 50%+，偏"课本插图"。
-    # 小红书高赞书法封面的字普遍占画面 15-25%，靠大量留白留出呼吸感。
-    # 单字 0.28、多字 0.45 — 单字按宽度定字号，多字保留横向排布空间。
-    # max_h 同步下调避免纵向溢出（单字 aspect≈1、多字 aspect>2）。
+    # 单字目标 48% 宽（白纸版"疑"字封面比例对齐）；多字保留 45% 横向排布。
+    # 单字 max_h 配套放大到 50%——bbox 1062x1506 类的纵向偏长字（aspect 0.71）
+    # 在 max_h=0.22 时 scale_h 强限到 21% 宽，达不到 48% 目标。
+    # layout 是相对锚点（divider/title = char_bottom + offset），字号变大时下方文字
+    # 自动跟随，无冲突。多字保留 0.22 高度上限（横向 aspect>2 时不会被高度卡住）。
     if is_multi:
         max_w = int(cover_width * 0.45)
         max_h = int(cover_height * 0.22)
     else:
-        max_w = int(cover_width * 0.28)
-        max_h = int(cover_height * 0.22)
+        max_w = int(cover_width * 0.48)
+        max_h = int(cover_height * 0.50)
 
     scale_w = max_w / cw
     scale_h = max_h / ch

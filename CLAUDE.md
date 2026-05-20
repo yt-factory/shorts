@@ -102,7 +102,7 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
   - `'pencil-zen'` (pencil default) — adaptive target_dark: darkest<100→55 (lightly stretched "禅意灰"), <160→40, ≥160→25 (effectively pencil-bold)
   - `'pencil-bold'` — always target_dark=25 (max contrast, brush-like)
 - **Layout**: divider at 52%, character bottom 3% above divider, title 58%, subtitle 66%. Fixed anchors regardless of char size.
-- **Size**: single char = 48% canvas width, multi-char = 70% (`--char` length determines mode).
+- **Size**: single char up to 48% width × 50% height; multi-char up to 45% width × 22% height (`--char` length determines mode). Single-char max_h=50% (not 22%) so tall-narrow chars (aspect ~0.7, e.g. 静) still hit the 48% width target instead of being scale_h-bound to 21%. Multi-char keeps 22% height — horizontal aspect>2 never hits the height limit anyway.
 - **Title auto-sizing**: reduces by char count, then by rendered width until within 90% canvas width.
 
 **XHS Cover Pencil (`xhs_cover_pencil.py`):**
