@@ -56,10 +56,14 @@ Raw video (webcam, 1920x1080, no rotation) → paper + ink detection → webcam_
   3. **Fade `st={stamp_start}` not `st=0`**: fade runs on the stamp stream's own timeline, which (because of `-loop 1`) begins at video t=0. With `st=0` the fade completes at 0.5s, long before overlay enables at 14s, so the stamp pops in at full opacity. Aligning `st` with `stamp_start` makes fade coincide with overlay enable.
 - Fallback: if `files/seal/chan_seal.png` is missing, Step 11 falls back to the original single-input `-vf` chain (fade-out + subtitle only), no seal, no crash.
 
-**Phone-specific:**
+**Phone-specific (`ink_video_processor.py`, legacy):**
 - **Rotation detection**: Scans all 4 edges (top/bottom/left/right) for book spine features (dark pixels + edge density). Maps book edge → rotation to bring book to top. Supports 180°, 90° CW, 90° CCW.
 - **Ink detection**: Global threshold(55) + white paper RGB mask(>150). Book at top after rotation → exclude top 30%.
 - **Rotation**: Uses `vflip,hflip` for 180° (pixel-exact), `transpose=1`/`transpose=2` for 90° CW/CCW.
+
+**Phone-specific (`phone_ink_processor.py`, current — `make phone-full`):**
+- **Manual rotation via `ROTATE=cw|ccw|180`**: lossless `ffmpeg transpose=1/2` after import. No content loss in the rotation itself; the trap is downstream.
+- **Step 4.5 — white-pad when `calculate_crop` collapses below ink width** (jing/鏡 case): After CW/CCW rotation a portrait source (720×1280) becomes landscape (1280×720). For 9:16 output, `calculate_crop`'s `ch > available_h` branch reaches the end (`ch=719`, `cw = ch × 9/16 = 404`) and re-derives `cw` without re-running the `safety_pad` floor that was supposed to keep `cw ≥ ink_w × 1.20`. Wide characters like 鏡 (ink_w=573) end up clipped ~80px on each side. The `safety_pad` check inside `calculate_crop` only fires once, before the canvas-height clamp. Fix: after the existing post-clamp, detect `crop['w'] < ink_w × 1.20` and pad the source vertically with white to satisfy `safe_ch = safe_cw / aspect`. `pad_top` is chosen so `ink['cy'] + pad_top` lands at the padded canvas's vertical midpoint (within the available budget) so the character ends up centered with symmetric white pillars top/bottom. The `pad=...:color=white` filter is prepended to all three vf chains: main video, hold-still PNG, and cover-frame PNG. Triggers only when `safe_ch > src_h` — native-portrait phone (no rotate) and webcam paths never see it.
 
 **Webcam-specific:**
 - **Shared module (`ink_extraction.py`)**: `flat_field_correct` (illumination normalization), `background_subtract_mask` (Otsu on diff with min-floor), `classify_medium` (histogram-based brush/pencil/empty), `remove_ruled_lines` (two-layer: projection detect + narrow subtract). Zero-cost on plain white paper.

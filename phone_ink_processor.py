@@ -37,7 +37,7 @@ from ink_video_processor import (
     build_subtitle_filter, build_srt_subtitle_filter,
     normalize_audio, generate_tts, sample_paper_brightness,
     generate_thumbnail, generate_calligraphy_thumbnail, calculate_crop,
-    DEFAULT_OUTPUT_WIDTH, DEFAULT_OUTPUT_HEIGHT,
+    DEFAULT_OUTPUT_WIDTH, DEFAULT_OUTPUT_HEIGHT, DEFAULT_MIN_SCALE,
     DEFAULT_HOLD_SECONDS, DEFAULT_FADE_IN, DEFAULT_FADE_OUT,
     TARGET_LUFS, SHORTS_MAX_DURATION, DEFAULT_FONT,
     DEFAULT_TTS_VOICE,
@@ -765,6 +765,43 @@ def process_phone_video(input_path, output_path, voiceover_path=None,
             crop['y'] = max(crop_y_min, min(ink['cy'] - crop['h'] // 2, crop_y_max - crop['h']))
             crop['scale_factor'] = output_width / crop['w']
 
+        # Step 4.5: 补白扩展（旋转后画布太矮导致 crop 被压窄到 ink bbox 之下时触发）
+        # 触发场景：rotate=cw/ccw 把 720x1280 转成 1280x720 后，src_h 只有 720。
+        # calculate_crop 内 `ch > available_h` 分支按 9:16 aspect 反推 cw，
+        # 当 ink_w 大（如「鏡」573px）时 cw 会被压到 ~404，远小于 ink_w*1.2=687，
+        # 两侧笔画各被切掉 ~80px。安全垫只在 calculate_crop 内部检查一次，
+        # 之后 aspect/canvas 重算时不再回头校验。
+        # 修复：检测到 crop['w'] < ink_w*1.20 即用白色补高 src，让 9:16 aspect 容得下整字。
+        pad_filter = None
+        min_cw_for_ink = int(ink['w'] * 1.20)
+        if crop['w'] < min_cw_for_ink:
+            aspect_target = output_width / output_height  # 0.5625
+            # 取既满足 ink_w 安全垫、又不破坏 min_scale 的最小 cw
+            safe_cw = max(min_cw_for_ink, int(output_width / DEFAULT_MIN_SCALE))
+            safe_cw = min(safe_cw, vi['width'])
+            safe_cw -= safe_cw % 2
+            safe_ch = int(safe_cw / aspect_target)
+            safe_ch -= safe_ch % 2
+            # 仅在 9:16 真的容不下时才补白（safe_ch > src_h）
+            if safe_ch > vi['height']:
+                total_pad = safe_ch - vi['height']
+                # 把字垂直居中：理想 pad_top 让 ink['cy']+pad_top = safe_ch/2
+                ideal_pad_top = safe_ch // 2 - ink['cy']
+                pad_top = max(0, min(ideal_pad_top, total_pad))
+                pad_top -= pad_top % 2  # ffmpeg 偶数对齐
+                crop['x'] = max(0, min(ink['cx'] - safe_cw // 2, vi['width'] - safe_cw))
+                crop['y'] = max(0, min(ink['cy'] + pad_top - safe_ch // 2,
+                                       safe_ch - safe_ch))  # = 0；padded_h == safe_ch
+                crop['w'] = safe_cw
+                crop['h'] = safe_ch
+                crop['scale_factor'] = output_width / safe_cw
+                pad_filter = (f"pad={vi['width']}:{safe_ch}:0:{pad_top}:color=white")
+                print(f"\n📐 Step 4.5: 补白扩展画布")
+                print(f"   ink_w={ink['w']}px 需要 cw≥{min_cw_for_ink}px，"
+                      f"但原 cw={crop['w']}px ← 旋转后 src_h={vi['height']} 不够高")
+                print(f"   源高 {vi['height']} → {safe_ch} (顶补 {pad_top}px 白)")
+                print(f"   新裁剪: ({crop['x']},{crop['y']}) {safe_cw}x{safe_ch}")
+
         sf = crop['scale_factor']
         print(f"\n✂️  Step 4: 裁剪参数")
         print(f"   区域: ({crop['x']},{crop['y']}) {crop['w']}x{crop['h']}")
@@ -772,7 +809,10 @@ def process_phone_video(input_path, output_path, voiceover_path=None,
 
         # Step 5-7: 视频处理
         print(f"\n🎬 Step 5-7: 视频处理...")
-        vf_parts = [
+        vf_parts = []
+        if pad_filter:
+            vf_parts.append(pad_filter)
+        vf_parts += [
             f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
             f"scale={output_width}:{output_height}:flags=lanczos",
         ]
@@ -809,7 +849,10 @@ def process_phone_video(input_path, output_path, voiceover_path=None,
             clean_frame_raw = os.path.join(tmpdir, 'clean_raw.png')
             cv2.imwrite(clean_frame_raw, clean_frame)
 
-            vf_still = [
+            vf_still = []
+            if pad_filter:
+                vf_still.append(pad_filter)
+            vf_still += [
                 f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
                 f"scale={output_width}:{output_height}:flags=lanczos",
             ]
@@ -1011,8 +1054,11 @@ def process_phone_video(input_path, output_path, voiceover_path=None,
                 cover_raw_path = os.path.join(tmpdir, 'cover_raw.png')
                 cv2.imwrite(cover_raw_path, cover_src)
                 cover_processed = os.path.join(tmpdir, 'cover_processed.png')
-                vf_cover = [f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
-                            f"scale={output_width}:{output_height}:flags=lanczos"]
+                vf_cover = []
+                if pad_filter:
+                    vf_cover.append(pad_filter)
+                vf_cover += [f"crop={crop['w']}:{crop['h']}:{crop['x']}:{crop['y']}",
+                             f"scale={output_width}:{output_height}:flags=lanczos"]
                 if enable_color_correct:
                     vf_cover.append(build_color_correction_filter(paper_p95))
                 vf_cover.append(build_sharpen_filter(sf))
